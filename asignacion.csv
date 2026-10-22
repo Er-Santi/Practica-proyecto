@@ -1,0 +1,10 @@
+cliente,PM,director
+Acme,pm.ana@empresa.com,directora.sol@empresa.com
+Globex,pm.luis@empresa.com,director.max@empresa.com
+ClientePrueba,PM Prueba,Director Prueba
+
+pm,perfil,horas_confirmacion
+PM Ana,rapido,
+PM Luis,normal,4
+PM Sara,lento,
+PM Omar,ausente,

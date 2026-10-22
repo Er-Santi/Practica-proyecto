@@ -1,4 +1,5 @@
 langgraph==1.2.14
+agentmail==2.0.18
 python-dotenv==1.2.1
 prompt-toolkit==3.0.53
 requests==2.32.5
