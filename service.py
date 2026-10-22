@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -10,8 +11,9 @@ from agent_state import AgentState, initial_agent_state
 from agentmail_client import AgentMailClient
 from audit_log import JsonlAuditLog, audit_error
 from email_utils import (
-    clarification_questions, confirmation_question, extract_request_details,
-    get_message_id, get_sender, load_assignments,
+    _ordered_by_timestamp, clarification_questions, confirmation_question,
+    extract_request_details, get_message_id, get_sender, infer_request_status,
+    load_assignments,
     normalize_text, simulated_confirmation_delay,
 )
 from exceptions import AgentMailError, OpenRouterError
@@ -19,8 +21,9 @@ from openrouter_client import OpenRouterClient
 from settings import (
     AUDIT_PATH,
     DEFAULT_RECONNECT_INTERVAL_SECONDS, DEFAULT_SIMULATION_SEED,
-    HEARTBEAT_INTERVAL_SECONDS, configured_max_llm_calls,
+    HEARTBEAT_INTERVAL_SECONDS, STATE_PATH, configured_max_llm_calls,
 )
+from state_store import AgentStateStoreError, load_agent_state, save_agent_state
 from workflow import build_graph
 
 def apply_human_confirmation(
@@ -46,16 +49,17 @@ def apply_human_confirmation(
     request["confirmacion_usuario"] = confirmed
     request["hora_confirmacion"] = state["hora_actual"] if confirmed else None
     request["confirmacion_simulada"] = False
-    request["estado"] = "Confirmada" if confirmed else "Notificada"
+    if confirmed:
+        request["estado"] = "Confirmada"
+        request["fecha_confirmacion"] = datetime.now(timezone.utc).isoformat()
+    elif request["estado"] == "Confirmada":
+        request["estado"] = "Notificada"
+        request.pop("fecha_confirmacion", None)
     event = {
         "hora_simulada": state["hora_actual"],
         "solicitud": identifier,
         "nodo": "confirmacion_humana",
-        "decision": (
-            "pm_confirmado_por_usuario"
-            if confirmed
-            else "pm_no_confirmado_por_usuario"
-        ),
+        "decision": "pm_confirmado_por_usuario" if confirmed else "pm_no_confirmado_por_usuario",
         "motivo": (
             "El usuario confirmó en la terminal la recepción del PM."
             if confirmed
@@ -66,6 +70,58 @@ def apply_human_confirmation(
     state["eventos"].append(event)
     answer = "Confirmada" if confirmed else "Aún no confirmada"
     print(f"[VALIDACIÓN] {request['asunto']}: {answer} según tu respuesta.")
+    return state
+
+
+def mark_request_opened(
+    state: AgentState,
+    *,
+    identifier: str,
+    audit: JsonlAuditLog,
+) -> AgentState:
+    request = next(
+        (item for item in state["solicitudes"] if item["id"] == identifier),
+        None,
+    )
+    if request is None or request["estado"] != "Nueva":
+        return state
+    request["estado"] = "Notificada"
+    request["fecha_apertura"] = datetime.now(timezone.utc).isoformat()
+    event = {
+        "hora_simulada": state["hora_actual"],
+        "solicitud": identifier,
+        "nodo": "abrir_correo_terminal",
+        "decision": "solicitud_abierta",
+        "motivo": "El usuario abrió el correo desde la terminal.",
+        "datos": {"estado": request["estado"]},
+    }
+    audit.append(event)
+    state["eventos"].append(event)
+    return state
+
+
+def close_request(
+    state: AgentState,
+    *,
+    request_number: int,
+    audit: JsonlAuditLog,
+) -> AgentState:
+    if not 1 <= request_number <= len(state["solicitudes"]):
+        raise IndexError("El número de solicitud está fuera de rango.")
+    request = state["solicitudes"][request_number - 1]
+    if request["estado"] in {"Confirmada", "Cerrada"}:
+        raise ValueError("La solicitud ya está finalizada.")
+    request["estado"] = "Cerrada"
+    request["fecha_cierre"] = datetime.now(timezone.utc).isoformat()
+    event = {
+        "hora_simulada": state["hora_actual"],
+        "solicitud": request["id"],
+        "nodo": "cerrar_solicitud_terminal",
+        "decision": "solicitud_cerrada",
+        "motivo": "El usuario cerró la solicitud desde la terminal.",
+    }
+    audit.append(event)
+    state["eventos"].append(event)
     return state
 
 
@@ -87,6 +143,7 @@ def assign_pm_to_request(
     pm_name = pm_name.strip()
     request["pm_responsable"] = pm_name
     request["hora_notificacion"] = state["hora_actual"]
+    request["fecha_notificacion"] = datetime.now(timezone.utc).isoformat()
     request["hora_confirmacion"] = None
     request.pop("confirmacion_usuario", None)
     request["confirmacion_simulada"] = False
@@ -102,12 +159,6 @@ def assign_pm_to_request(
         if value is None
     ]
     request["preguntas_aclaracion"] = clarification_questions(request)
-    request["estado"] = (
-        "Notificada (datos pendientes)"
-        if request["datos_faltantes"]
-        else "Notificada"
-    )
-
     profile_map = {
         normalize_text(str(name)): profile
         for name, profile in (pm_profiles or {}).items()
@@ -200,6 +251,9 @@ def apply_pm_update(
             for key in ("cliente", "rol", "cantidad_posiciones", "pm_responsable")
             if parsed[key] is not None
         }
+        request_status = infer_request_status(response_text)
+        if request_status:
+            updates["estado_solicitud"] = request_status
         if not updates:
             error = ValueError(
                 "Sin OpenRouter, escribe los datos como Cliente: ..., Rol: ..., "
@@ -224,12 +278,33 @@ def apply_pm_update(
             "cantidad_posiciones",
             "posiciones",
             "pm_responsable",
+            "estado",
         )
     }
     for key in ("cliente", "rol", "cantidad_posiciones", "pm_responsable"):
         value = updates.get(key)
         if value is not None:
             request[key] = value
+    reported_status = updates.get("estado_solicitud")
+    if reported_status is not None:
+        request_statuses = {
+            "escalada": "Escalada",
+            "confirmada": "Confirmada",
+            "cerrada": "Cerrada",
+        }
+        status = request_statuses.get(str(reported_status))
+        if status is None:
+            error = ValueError(
+                f"Estado de solicitud no reconocido: {reported_status!r}."
+            )
+            _record_update_error(state, request, audit, error)
+            raise error
+        request["estado"] = status
+        request["fecha_cambio_estado"] = datetime.now(timezone.utc).isoformat()
+        if status == "Confirmada":
+            request["fecha_confirmacion"] = request["fecha_cambio_estado"]
+        elif status == "Cerrada":
+            request["fecha_cierre"] = request["fecha_cambio_estado"]
     if updates.get("posiciones"):
         request["posiciones"] = updates["posiciones"]
         if updates.get("cantidad_posiciones") is None:
@@ -263,11 +338,6 @@ def apply_pm_update(
         if value is None
     ]
     request["preguntas_aclaracion"] = clarification_questions(request)
-    request["estado"] = (
-        "Notificada (datos pendientes)"
-        if request["datos_faltantes"]
-        else "Notificada"
-    )
     changed_fields = {
         key: request.get(key)
         for key, previous in before.items()
@@ -304,6 +374,75 @@ def apply_pm_update(
         )
     )
     return state
+
+
+def process_due_reminders(
+    state: AgentState,
+    *,
+    audit: JsonlAuditLog,
+    now: datetime | None = None,
+) -> int:
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    reminders_sent = 0
+
+    for request in state["solicitudes"]:
+        if (
+            request.get("estado") in {"Confirmada", "Cerrada", "Escalada"}
+            or request.get("recordatorio_enviado")
+            or not request.get("pm_responsable")
+        ):
+            continue
+        received_at_text = request.get("fecha_recepcion")
+        if not isinstance(received_at_text, str):
+            continue
+        try:
+            received_at = datetime.fromisoformat(
+                received_at_text.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            audit_error(
+                audit,
+                exc,
+                node="calcular_recordatorio",
+                hora_simulada=state["hora_actual"],
+                solicitud=request["id"],
+                details={"fecha_recepcion": received_at_text},
+            )
+            continue
+        if received_at.tzinfo is None:
+            received_at = received_at.replace(tzinfo=timezone.utc)
+        if current_time - received_at < timedelta(hours=24):
+            continue
+
+        request["estado"] = "Recordatorio enviado"
+        request["recordatorio_enviado"] = True
+        request["fecha_recordatorio"] = current_time.isoformat()
+        event = {
+            "hora_simulada": state["hora_actual"],
+            "solicitud": request["id"],
+            "nodo": "enviar_recordatorio_pm",
+            "decision": "recordatorio_enviado",
+            "motivo": (
+                "Se generó un recordatorio simulado al PM al cumplirse 24 horas "
+                "desde la recepción; no se envió correo real."
+            ),
+            "datos": {
+                "pm_responsable": request["pm_responsable"],
+                "fecha_recepcion": received_at.isoformat(),
+                "fecha_recordatorio": current_time.isoformat(),
+                "simulado": True,
+            },
+        }
+        audit.append(event)
+        state["eventos"].append(event)
+        print(
+            f"[RECORDATORIO SIMULADO] PM {request['pm_responsable']} | "
+            f"{request['asunto']} | solicitud {request['id']}"
+        )
+        reminders_sent += 1
+    return reminders_sent
 
 
 def _record_update_error(
@@ -360,8 +499,10 @@ def run_agent_forever(
     pm_profiles: Mapping[str, Mapping[str, Any]] | None = None,
     simulation_seed: int = DEFAULT_SIMULATION_SEED,
     state_lock: Any | None = None,
+    state_path: Path | None = None,
+    initial_state: AgentState | None = None,
 ) -> AgentState:
-    """Process AgentMail messages from its event stream without inbox polling."""
+    """Load the existing inbox once, then process WebSocket events and deadlines."""
     if reconnect_interval <= 0:
         raise ValueError("reconnect_interval debe ser mayor que cero.")
     if heartbeat_interval <= 0:
@@ -376,9 +517,17 @@ def run_agent_forever(
         simulation_seed=simulation_seed,
     )
     audit = JsonlAuditLog(audit_path)
-    state = initial_agent_state()
+    state = (
+        initial_state
+        if initial_state is not None
+        else load_agent_state(state_path)
+        if state_path is not None
+        else initial_agent_state()
+    )
+    state["simular_confirmacion_automatica"] = False
     lock = state_lock or threading.RLock()
     next_heartbeat = time.monotonic() + heartbeat_interval
+    next_reminder_check = time.monotonic() + 60
 
     async def receive_events(
         event_queue: asyncio.Queue[dict[str, Any]],
@@ -386,8 +535,121 @@ def run_agent_forever(
         async for event in client.message_events():
             await event_queue.put(event)
 
+    def save_state_locked() -> None:
+        if state_path is not None:
+            save_agent_state(state_path, state)
+
+    async def process_message(
+        message: dict[str, Any],
+        *,
+        historical: bool,
+        event_id: str | None = None,
+    ) -> None:
+        nonlocal state
+        identifier = get_message_id(message)
+        if not identifier:
+            audit_error(
+                audit,
+                "Se descartó un mensaje sin message_id.",
+                node="leer_bandeja_agentmail",
+                hora_simulada=state["hora_actual"],
+                details={"event_id": event_id},
+            )
+            return
+        with lock:
+            if identifier in state["correos_procesados"]:
+                return
+
+        prefix = "CORREO ANTIGUO" if historical else "NUEVO CORREO"
+        print(
+            f"\n[{prefix}] De: {get_sender(message)} | "
+            f"Asunto: {message.get('subject') or '(sin asunto)'}"
+        )
+
+        def invoke_graph() -> None:
+            nonlocal state
+            with lock:
+                state = graph.invoke(
+                    {
+                        **state,
+                        "correos_evento": [message],
+                        "simular_confirmacion_automatica": False,
+                    },
+                    config={"recursion_limit": 16},
+                )
+                state["simular_confirmacion_automatica"] = False
+                save_state_locked()
+                on_state(state)
+
+        try:
+            await asyncio.to_thread(invoke_graph)
+        except Exception as exc:
+            audit_error(
+                audit,
+                exc,
+                node="procesar_correo_langgraph",
+                hora_simulada=state["hora_actual"],
+                solicitud=identifier,
+                details={"event_id": event_id, "historico": historical},
+            )
+            print(
+                f"\n[ERROR LangGraph] No se pudo procesar el correo "
+                f"{identifier}: {type(exc).__name__}: {exc}"
+            )
+
+    async def synchronize_existing_messages() -> None:
+        summaries = await asyncio.to_thread(client.list_messages)
+        unique_summaries: dict[str, dict[str, Any]] = {}
+        for summary in summaries:
+            identifier = get_message_id(summary)
+            if not identifier:
+                audit_error(
+                    audit,
+                    "AgentMail devolvió un correo antiguo sin message_id.",
+                    node="leer_bandeja_agentmail",
+                    hora_simulada=state["hora_actual"],
+                )
+                continue
+            with lock:
+                already_processed = identifier in state["correos_procesados"]
+            if not already_processed:
+                unique_summaries[identifier] = summary
+
+        pending: list[dict[str, Any]] = []
+        for identifier in unique_summaries:
+            try:
+                message = await asyncio.to_thread(client.get_message, identifier)
+            except AgentMailError as exc:
+                audit_error(
+                    audit,
+                    exc,
+                    node="leer_correo_historico",
+                    hora_simulada=state["hora_actual"],
+                    solicitud=identifier,
+                )
+                print(
+                    f"\n[ERROR AgentMail] No se pudo recuperar el correo "
+                    f"histórico {identifier}: {exc}"
+                )
+                continue
+            message.setdefault("message_id", identifier)
+            pending.append(message)
+
+        for message in _ordered_by_timestamp(pending):
+            if stop_event.is_set():
+                return
+            await process_message(message, historical=True)
+
+    def check_reminders() -> int:
+        with lock:
+            sent = process_due_reminders(state, audit=audit)
+            if sent:
+                save_state_locked()
+                on_state(state)
+            return sent
+
     async def run_listener() -> AgentState:
-        nonlocal state, next_heartbeat
+        nonlocal state, next_heartbeat, next_reminder_check
         last_error: str | None = None
 
         while not stop_event.is_set():
@@ -414,6 +676,9 @@ def run_agent_forever(
                         if now >= next_heartbeat:
                             print(".", end="", flush=True)
                             next_heartbeat = now + heartbeat_interval
+                        if now >= next_reminder_check:
+                            await asyncio.to_thread(check_reminders)
+                            next_reminder_check = now + 60
                         continue
 
                     if event.get("type") == "subscribed":
@@ -422,6 +687,21 @@ def run_agent_forever(
                             f"{client.inbox_id} por WebSocket."
                         )
                         last_error = None
+                        try:
+                            await synchronize_existing_messages()
+                        except AgentMailError as exc:
+                            audit_error(
+                                audit,
+                                exc,
+                                node="sincronizar_bandeja_historica",
+                                hora_simulada=state["hora_actual"],
+                            )
+                            print(
+                                f"\n[ERROR AgentMail] No se pudo sincronizar "
+                                f"la bandeja histórica: {exc}"
+                            )
+                        await asyncio.to_thread(check_reminders)
+                        next_reminder_check = time.monotonic() + 60
                         continue
                     if event.get("type") != "message_received":
                         print(
@@ -432,64 +712,28 @@ def run_agent_forever(
 
                     message = event.get("message")
                     if not isinstance(message, dict):
-                        print(
-                            "\n[AgentMail] Se recibió un evento sin mensaje válido."
-                        )
-                        continue
-                    identifier = get_message_id(message)
-                    if not identifier:
-                        error_event = {
-                            "hora_simulada": state["hora_actual"],
-                            "solicitud": None,
-                            "nodo": "leer_evento_agentmail",
-                            "decision": "evento_sin_message_id",
-                            "motivo": (
-                                "Se descartó un evento de correo sin message_id."
-                            ),
-                        }
-                        audit.append(error_event)
-                        print(f"\n[ERROR AgentMail] {error_event['motivo']}")
-                        continue
-                    if identifier in state["correos_procesados"]:
-                        continue
-
-                    print(
-                        f"\n[NUEVO CORREO] De: {get_sender(message)} | "
-                        f"Asunto: {message.get('subject') or '(sin asunto)'}"
-                    )
-
-                    def process_message() -> None:
-                        nonlocal state
-                        with lock:
-                            state = graph.invoke(
-                                {
-                                    **state,
-                                    "correos_evento": [message],
-                                },
-                                config={"recursion_limit": 16},
-                            )
-                            on_state(state)
-
-                    try:
-                        await asyncio.to_thread(process_message)
-                    except Exception as exc:
                         audit_error(
                             audit,
-                            exc,
-                            node="procesar_correo_langgraph",
+                            "Se recibió un evento sin mensaje válido.",
+                            node="leer_evento_agentmail",
                             hora_simulada=state["hora_actual"],
-                            solicitud=identifier,
                             details={"event_id": event.get("event_id")},
                         )
-                        print(
-                            f"\n[ERROR LangGraph] No se pudo procesar el correo "
-                            f"{identifier}: {type(exc).__name__}: {exc}"
-                        )
+                        print("\n[ERROR AgentMail] Evento sin mensaje válido.")
+                        continue
+                    await process_message(
+                        message,
+                        historical=False,
+                        event_id=str(event.get("event_id") or ""),
+                    )
 
                     now = time.monotonic()
                     if now >= next_heartbeat:
                         print(".", end="", flush=True)
                         next_heartbeat = now + heartbeat_interval
+                    if now >= next_reminder_check:
+                        await asyncio.to_thread(check_reminders)
+                        next_reminder_check = now + 60
             except AgentMailError as exc:
                 if stop_event.is_set():
                     break

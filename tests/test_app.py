@@ -2,6 +2,7 @@ import asyncio
 import json
 import sys
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -11,6 +12,7 @@ from agentmail import MessageReceivedEvent, Subscribed
 
 from app import (
     AgentMailClient,
+    AgentStateStoreError,
     JsonlAuditLog,
     OpenRouterClient,
     OpenRouterError,
@@ -18,6 +20,7 @@ from app import (
     apply_pm_update,
     assign_pm_to_request,
     classify_by_rules,
+    close_request,
     configured_max_llm_calls,
     get_message_id,
     get_sender,
@@ -25,11 +28,14 @@ from app import (
     load_assignments,
     load_pm_profiles,
     main,
+    mark_request_opened,
     request_fingerprint,
     run_agent_forever,
     run_phase_one,
+    process_due_reminders,
     simulated_confirmation_delay,
 )
+from state_store import load_agent_state, save_agent_state
 
 
 def make_message(
@@ -851,7 +857,7 @@ def test_missing_pm_is_audited_as_pending_not_as_notified(tmp_path: Path) -> Non
 
     assert result["solicitudes"][0]["pm_responsable"] is None
     assert result["solicitudes"][0]["hora_notificacion"] is None
-    assert result["solicitudes"][0]["estado"] == "Pendiente de asignación"
+    assert result["solicitudes"][0]["estado"] == "Nueva"
     events = [
         json.loads(line)
         for line in (tmp_path / "auditoria.jsonl").read_text(encoding="utf-8").splitlines()
@@ -872,6 +878,11 @@ def test_pm_can_be_assigned_to_one_request_and_notified_from_terminal(
     state = run_phase_one(
         FakeAgentMailClient([[message]]),
         audit_path=audit_path,
+        state={
+            **initial_agent_state(),
+            "simular_confirmacion_automatica": False,
+        },
+        assignments={},
     )
 
     same_state = assign_pm_to_request(
@@ -887,11 +898,18 @@ def test_pm_can_be_assigned_to_one_request_and_notified_from_terminal(
     request = state["solicitudes"][0]
     assert same_state is state
     assert request["pm_responsable"] == "PM Ana"
-    assert request["estado"] == "Notificada"
+    assert request["estado"] == "Nueva"
     assert request["hora_notificacion"] == state["hora_actual"]
     assert request["datos_faltantes"] == []
     assert request["perfil_pm"] == "rapido"
     assert "ASIGNACIÓN" in capsys.readouterr().out
+
+    mark_request_opened(
+        state,
+        identifier="m1",
+        audit=JsonlAuditLog(audit_path),
+    )
+    assert request["estado"] == "Notificada"
 
     events = [
         json.loads(line)
@@ -1068,7 +1086,7 @@ def test_service_repeats_graph_until_stopped_and_emits_heartbeat(
         heartbeat_interval=1e-9,
     )
 
-    assert client.list_calls == 0
+    assert client.list_calls == 1
     assert client.stream_calls == 1
     assert result["hora_actual"] == 2
     assert result["correos_procesados"] == ["m1", "m2"]
@@ -1096,7 +1114,7 @@ def test_service_remains_idle_without_polling_until_stopped(
     )
     timer.join()
 
-    assert client.list_calls == 0
+    assert client.list_calls == 1
     assert client.stream_calls == 1
     assert result["correos_procesados"] == []
     assert not (tmp_path / "audit.jsonl").exists()
@@ -1127,6 +1145,164 @@ def test_graph_audit_contains_required_fields(tmp_path: Path) -> None:
         {"hora_simulada", "solicitud", "nodo", "decision", "motivo"} <= event.keys()
         for event in events
     )
+
+
+def test_service_backfills_old_messages_and_restores_active_state(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    old_message = make_message(
+        "old-1",
+        "Solicitud de posición",
+        "Cliente: Acme\nRol: Analista\nCantidad: 2",
+    )
+    state_path = tmp_path / "agent-state.json"
+    stop_event = threading.Event()
+    client = FakeAgentMailClient([[old_message]], stop_event=stop_event)
+    states = []
+
+    def stop_after_backfill(state) -> None:
+        states.append(state)
+        if "old-1" in state["correos_procesados"]:
+            stop_event.set()
+
+    result = run_agent_forever(
+        client,
+        audit_path=tmp_path / "audit.jsonl",
+        stop_event=stop_event,
+        on_state=stop_after_backfill,
+        assignments={},
+        state_path=state_path,
+    )
+
+    assert client.list_calls == 1
+    assert result["correos_procesados"] == ["old-1"]
+    assert result["solicitudes"][0]["estado"] == "Nueva"
+    assert "CORREO ANTIGUO" in capsys.readouterr().out
+    restored = load_agent_state(state_path)
+    assert restored["correos_procesados"] == ["old-1"]
+    assert restored["solicitudes"][0]["id"] == "old-1"
+
+
+def test_due_reminder_is_sent_once_after_24_hours(tmp_path: Path) -> None:
+    message = make_message(
+        "m1",
+        "Solicitud de personal",
+        "Cliente: Acme\nRol: Analista\nCantidad: 1",
+    )
+    audit_path = tmp_path / "audit.jsonl"
+    state = run_phase_one(
+        FakeAgentMailClient([[message]]),
+        audit_path=audit_path,
+        assignments={"Acme": "PM Ana"},
+    )
+    request = state["solicitudes"][0]
+    received_at = datetime.fromisoformat(request["fecha_recepcion"].replace("Z", "+00:00"))
+    reminder_time = received_at.replace(tzinfo=timezone.utc) + timedelta(hours=24)
+
+    sent = process_due_reminders(
+        state,
+        audit=JsonlAuditLog(audit_path),
+        now=reminder_time,
+    )
+
+    assert sent == 1
+    assert request["estado"] == "Recordatorio enviado"
+    assert process_due_reminders(
+        state,
+        audit=JsonlAuditLog(audit_path),
+        now=reminder_time + timedelta(hours=1),
+    ) == 0
+    events = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    reminder = next(event for event in events if event["decision"] == "recordatorio_enviado")
+    assert reminder["datos"]["simulado"] is True
+
+
+def test_opened_request_and_terminal_close_transition_are_audited(
+    tmp_path: Path,
+) -> None:
+    message = make_message(
+        "m1",
+        "Solicitud de personal",
+        "Cliente: Acme\nRol: Analista\nCantidad: 1",
+    )
+    audit_path = tmp_path / "audit.jsonl"
+    state = run_phase_one(
+        FakeAgentMailClient([[message]]),
+        audit_path=audit_path,
+        state={
+            **initial_agent_state(),
+            "simular_confirmacion_automatica": False,
+        },
+        assignments={},
+    )
+    request = state["solicitudes"][0]
+    assert request["estado"] == "Nueva"
+
+    mark_request_opened(
+        state,
+        identifier="m1",
+        audit=JsonlAuditLog(audit_path),
+    )
+    assert request["estado"] == "Notificada"
+
+    close_request(
+        state,
+        request_number=1,
+        audit=JsonlAuditLog(audit_path),
+    )
+    assert request["estado"] == "Cerrada"
+    events = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(event["decision"] == "solicitud_abierta" for event in events)
+    assert any(event["decision"] == "solicitud_cerrada" for event in events)
+
+
+def test_pm_status_update_escalates_or_confirms_request(tmp_path: Path) -> None:
+    original = make_message(
+        "m1",
+        "Solicitud de personal",
+        "Cliente: Acme\nRol: Analista\nCantidad: 1",
+    )
+    reply = make_message(
+        "m2",
+        "Re: Solicitud de personal",
+        "We are working on it now.",
+        in_reply_to="m1",
+    )
+    audit_path = tmp_path / "audit.jsonl"
+    state = run_phase_one(
+        FakeAgentMailClient([[original]]),
+        audit_path=audit_path,
+        assignments={"Acme": "PM Ana"},
+    )
+
+    updated = run_phase_one(
+        FakeAgentMailClient([[original, reply]]),
+        audit_path=audit_path,
+        state=state,
+        assignments={"Acme": "PM Ana"},
+    )
+
+    assert updated["solicitudes"][0]["estado"] == "Escalada"
+    reply_email = next(
+        email for email in updated["correos_clasificados"]
+        if email["message_id"] == "m2"
+    )
+    assert reply_email["categoria"] == "actualizacion_solicitud"
+
+
+def test_state_store_rejects_corrupt_state_file(tmp_path: Path) -> None:
+    state_path = tmp_path / "agent-state.json"
+    state_path.write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(AgentStateStoreError, match="No se pudo leer"):
+        load_agent_state(state_path)
 
 
 def test_agentmail_client_reply_and_send_use_real_endpoints(monkeypatch) -> None:

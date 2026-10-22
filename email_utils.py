@@ -277,6 +277,60 @@ def clarification_questions(request: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def infer_request_status(text: str) -> str | None:
+    normalized = normalize_text(text)
+    if any(
+        phrase in normalized
+        for phrase in (
+            "we are working on it",
+            "we're working on it",
+            "working on this",
+            "currently working",
+            "estamos trabajando",
+            "estoy trabajando",
+            "ya estamos trabajando",
+            "en proceso",
+            "in progress",
+        )
+    ):
+        return "escalada"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "cancelled",
+            "canceled",
+            "request is closed",
+            "closing this request",
+            "position is no longer needed",
+            "solicitud cerrada",
+            "solicitud cancelada",
+            "cerramos la solicitud",
+            "cancelamos la solicitud",
+        )
+    ):
+        return "cerrada"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "request is complete",
+            "request has been completed",
+            "positions are filled",
+            "position is filled",
+            "all positions are filled",
+            "the role is filled",
+            "solicitud completada",
+            "solicitud atendida",
+            "posiciones cubiertas",
+            "puesto cubierto",
+            "ya fue resuelta",
+            "ya se cubrio",
+            "ya se cubrió",
+        )
+    ):
+        return "confirmada"
+    return None
+
+
 def request_fingerprint(message: dict[str, Any]) -> str:
     subject = normalize_text(str(message.get("subject") or ""))
     subject = re.sub(r"^(?:(?:re|fw|fwd)\s*:\s*)+", "", subject)
@@ -310,6 +364,11 @@ def classify_by_rules(
     if reply_to:
         referenced_ids.add(str(reply_to))
     if referenced_ids.intersection(known_request_ids):
+        if infer_request_status(body):
+            return (
+                "actualizacion_solicitud",
+                "El PM informó un cambio de estado para una solicitud relacionada.",
+            )
         return "duplicado", "El correo hace referencia a una solicitud ya registrada."
 
     has_role = any(marker in normalized_body for marker in HIRING_ROLE_MARKERS)

@@ -15,13 +15,17 @@ from service import (
     apply_human_confirmation,
     apply_pm_update,
     assign_pm_to_request,
+    close_request,
+    mark_request_opened,
     run_agent_forever,
 )
 from settings import (
     DEFAULT_SIMULATION_SEED,
     REQUEST_TIMEOUT_SECONDS,
+    STATE_PATH,
     configured_max_llm_calls,
 )
+from state_store import AgentStateStoreError, load_agent_state, save_agent_state
 
 
 def _audit_terminal_error(
@@ -104,12 +108,41 @@ def run_terminal_agent(
     llm: OpenRouterClient | None = None,
     pm_profiles: Mapping[str, Mapping[str, Any]] | None = None,
     simulation_seed: int = DEFAULT_SIMULATION_SEED,
+    state_path: Path = STATE_PATH,
 ) -> None:
     stop_event = threading.Event()
     state_lock = threading.RLock()
-    state_snapshot = initial_agent_state()
-    announced_request_ids: set[str] = set()
+    state_snapshot = load_agent_state(state_path)
+    announced_request_ids = {
+        request["id"] for request in state_snapshot["solicitudes"]
+    }
     session: PromptSession[str] = PromptSession()
+
+    def active_messages(state: AgentState) -> list[dict[str, Any]]:
+        requests_by_id = {
+            request["id"]: request
+            for request in state["solicitudes"]
+        }
+        completed_states = {"Confirmada", "Cerrada"}
+        visible: list[dict[str, Any]] = []
+        for message in state["correos_clasificados"]:
+            related_id = message.get("solicitud_id") or get_message_id(message)
+            request = requests_by_id.get(str(related_id))
+            if request is None or request.get("estado") not in completed_states:
+                visible.append(message)
+        return visible
+
+    def persist_state() -> None:
+        try:
+            with state_lock:
+                save_agent_state(state_path, state_snapshot)
+        except AgentStateStoreError as exc:
+            audit_error(
+                JsonlAuditLog(audit_path),
+                exc,
+                node="persistir_estado_agente",
+            )
+            print(f"\n[ERROR Estado] {exc}")
 
     def store_state(new_state: AgentState) -> None:
         nonlocal state_snapshot
@@ -159,6 +192,8 @@ def run_terminal_agent(
                 pm_profiles=pm_profiles,
                 simulation_seed=simulation_seed,
                 state_lock=state_lock,
+                state_path=state_path,
+                initial_state=state_snapshot,
             )
         except Exception as exc:
             _audit_terminal_error(audit_path, "ejecutar_agente", exc)
@@ -198,7 +233,7 @@ def run_terminal_agent(
                 normalized = command.casefold()
                 with state_lock:
                     state = state_snapshot
-                messages = list(state["correos_clasificados"])
+                messages = active_messages(state)
 
                 if normalized in {"stop", "quit", "exit", "q"}:
                     break
@@ -213,6 +248,7 @@ def run_terminal_agent(
                         "  assign <n> <PM>     Asigna un PM a una solicitud de esta sesión\n"
                         "  pm <n>              Escribe en lenguaje natural la respuesta del PM\n"
                         "  confirm <n> sí|no   Confirma o corrige inmediatamente la recepción del PM\n"
+                        "  close <n>           Cierra una solicitud atendida/cancelada\n"
                         "  help, h, ?          Ayuda\n"
                         "  stop, quit, q       Detiene el agente"
                     )
@@ -226,10 +262,13 @@ def run_terminal_agent(
                     print(
                         f"Hora simulada: {state['hora_actual']} | "
                         f"Correos procesados: {len(state['correos_procesados'])} | "
-                        f"Solicitudes: {len(state['solicitudes'])} | "
+                        f"Solicitudes activas: {sum(request['estado'] not in {'Confirmada', 'Cerrada'} for request in state['solicitudes'])} | "
+                        f"Finalizadas: {sum(request['estado'] in {'Confirmada', 'Cerrada'} for request in state['solicitudes'])} | "
                         f"Llamadas OpenRouter: {llm_usage}"
                     )
                     for index, request in enumerate(state["solicitudes"], start=1):
+                        if request["estado"] in {"Confirmada", "Cerrada"}:
+                            continue
                         print(
                             f"  #{index} {request['asunto']} | "
                             f"PM: {request['pm_responsable'] or 'sin asignar'} | "
@@ -264,6 +303,7 @@ def run_terminal_agent(
                                 confirmed=answer in {"si", "yes", "y"},
                                 audit=JsonlAuditLog(audit_path),
                             )
+                        persist_state()
                     except (KeyError, ValueError) as exc:
                         print(f"No se pudo registrar la confirmación: {exc}")
                         _audit_terminal_error(
@@ -291,6 +331,7 @@ def run_terminal_agent(
                                 pm_profiles=pm_profiles,
                                 simulation_seed=simulation_seed,
                             )
+                        persist_state()
                     except (IndexError, ValueError) as exc:
                         print(f"No se pudo asignar el PM: {exc}")
                         _audit_terminal_error(
@@ -327,8 +368,35 @@ def run_terminal_agent(
                                 llm=llm,
                                 assignments=assignments,
                             )
+                        persist_state()
                     except (IndexError, OpenRouterError, ValueError) as exc:
                         print(f"No se pudo aplicar la respuesta del PM: {exc}")
+                elif normalized.startswith(("close ", "cerrar ")):
+                    parts = command.split()
+                    if len(parts) != 2:
+                        print("Uso: close <número de solicitud>.")
+                        continue
+                    try:
+                        request_index = int(parts[1])
+                    except ValueError:
+                        print("El número de solicitud debe ser un entero.")
+                        continue
+                    try:
+                        with state_lock:
+                            close_request(
+                                state_snapshot,
+                                request_number=request_index,
+                                audit=JsonlAuditLog(audit_path),
+                            )
+                        persist_state()
+                    except (IndexError, ValueError) as exc:
+                        print(f"No se pudo cerrar la solicitud: {exc}")
+                        _audit_terminal_error(
+                            audit_path,
+                            "cerrar_solicitud_terminal",
+                            exc,
+                            request_number=request_index,
+                        )
                 elif normalized in {"list", "l"}:
                     if not messages:
                         print("Todavía no se han procesado correos.")
@@ -340,6 +408,17 @@ def run_terminal_agent(
                     if selected is not None:
                         index, message = selected
                         display_full_message(message, index)
+                        related_id = str(
+                            message.get("solicitud_id")
+                            or get_message_id(message)
+                        )
+                        with state_lock:
+                            mark_request_opened(
+                                state_snapshot,
+                                identifier=related_id,
+                                audit=JsonlAuditLog(audit_path),
+                            )
+                        persist_state()
                 elif normalized.startswith(("reply ", "rep ")):
                     selected = selected_message(command, messages)
                     if selected is not None:

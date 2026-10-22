@@ -36,6 +36,9 @@ from service import (
     apply_human_confirmation,
     apply_pm_update,
     assign_pm_to_request,
+    close_request,
+    mark_request_opened,
+    process_due_reminders,
     run_agent_forever,
     run_phase_one,
 )
@@ -51,8 +54,10 @@ from settings import (
     OPENROUTER_DEFAULT_MODEL,
     PM_PROFILES_PATH,
     REQUEST_TIMEOUT_SECONDS,
+    STATE_PATH,
     configured_max_llm_calls,
 )
+from state_store import AgentStateStoreError
 from terminal import run_terminal_agent
 from workflow import build_graph
 
@@ -75,6 +80,7 @@ __all__ = [
     "OpenRouterError",
     "PM_PROFILES_PATH",
     "REQUEST_TIMEOUT_SECONDS",
+    "STATE_PATH",
     "_extract_labeled_value",
     "_ordered_by_timestamp",
     "apply_human_confirmation",
@@ -83,6 +89,7 @@ __all__ = [
     "build_graph",
     "clarification_questions",
     "classify_by_rules",
+    "close_request",
     "confirmation_question",
     "configured_max_llm_calls",
     "extract_request_details",
@@ -91,6 +98,8 @@ __all__ = [
     "initial_agent_state",
     "load_assignments",
     "load_pm_profiles",
+    "mark_request_opened",
+    "process_due_reminders",
     "message_text",
     "normalize_text",
     "request_fingerprint",
@@ -127,6 +136,12 @@ def main() -> int:
         type=Path,
         default=AUDIT_PATH,
         help="ruta del log JSON Lines de auditoría (por defecto auditoria.jsonl)",
+    )
+    parser.add_argument(
+        "--state",
+        type=Path,
+        default=STATE_PATH,
+        help="ruta del estado persistente de solicitudes (por defecto estado_agente.json)",
     )
     parser.add_argument(
         "--assignments",
@@ -220,9 +235,14 @@ def main() -> int:
             llm=llm,
             pm_profiles=pm_profiles,
             simulation_seed=args.seed,
+            state_path=args.state,
         )
     except KeyboardInterrupt:
         print("\nAgente detenido.")
+    except AgentStateStoreError as exc:
+        audit_error(audit, exc, node="cargar_estado_agente")
+        print(f"No se pudo cargar el estado guardado: {exc}")
+        return 1
     return 0
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from langgraph.graph import END, START, StateGraph
@@ -8,7 +9,8 @@ from audit_log import JsonlAuditLog, audit_error
 from email_utils import (
     _ordered_by_timestamp, classify_by_rules, clarification_questions,
     confirmation_question, extract_request_details, get_message_id, get_sender,
-    load_assignments, load_pm_profiles, normalize_text, request_fingerprint,
+    infer_request_status, load_assignments, load_pm_profiles, message_text,
+    normalize_text, request_fingerprint,
     simulated_confirmation_delay,
 )
 from exceptions import AgentMailError, OpenRouterError
@@ -120,6 +122,7 @@ def build_graph(
                     "cantidad_posiciones",
                     "posiciones",
                     "pm_responsable",
+                    "estado",
                     "datos_faltantes",
                     "asunto",
                 )
@@ -254,6 +257,7 @@ def build_graph(
                             "cantidad_posiciones",
                             "posiciones",
                             "pm_responsable",
+                            "estado",
                         )
                     }
                     for key in ("cliente", "rol", "cantidad_posiciones", "pm_responsable"):
@@ -295,12 +299,29 @@ def build_graph(
                         if llm_result
                         else []
                     ) or clarification_questions(target_request)
-                    if target_request.get("pm_responsable"):
-                        target_request["estado"] = (
-                            "Notificada (datos pendientes)"
-                            if target_request["datos_faltantes"]
-                            else "Notificada"
-                        )
+                    reported_status = (
+                        llm_result.get("estado_solicitud")
+                        if llm_result
+                        else infer_request_status(message_text(email))
+                    )
+                    if reported_status:
+                        state_labels = {
+                            "escalada": "Escalada",
+                            "confirmada": "Confirmada",
+                            "cerrada": "Cerrada",
+                        }
+                        target_request["estado"] = state_labels[reported_status]
+                        target_request["fecha_cambio_estado"] = datetime.now(
+                            timezone.utc
+                        ).isoformat()
+                        if reported_status == "confirmada":
+                            target_request["fecha_confirmacion"] = (
+                                target_request["fecha_cambio_estado"]
+                            )
+                        elif reported_status == "cerrada":
+                            target_request["fecha_cierre"] = (
+                                target_request["fecha_cambio_estado"]
+                            )
                     updates = {
                         key: target_request.get(key)
                         for key in before
@@ -342,6 +363,7 @@ def build_graph(
                                 "posiciones",
                                 "pm_responsable",
                                 "datos_faltantes",
+                                "estado",
                                 "asunto",
                             )
                         }
@@ -439,6 +461,16 @@ def build_graph(
                         "confirmacion_usuario": None,
                         "estado": "Nueva",
                         "hora_notificacion": None,
+                        "fecha_recepcion": (
+                            str(
+                                email.get("timestamp")
+                                or email.get("received_at")
+                                or email.get("created_at")
+                                or datetime.now(timezone.utc).isoformat()
+                            )
+                        ),
+                        "fecha_recordatorio": None,
+                        "recordatorio_enviado": False,
                         "actualizaciones": [],
                     }
                 )
@@ -512,12 +544,12 @@ def build_graph(
                 questions = request.get("preguntas_aclaracion", [])
                 if recipient:
                     request["hora_notificacion"] = state["hora_actual"]
+                    request["fecha_notificacion"] = datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                    if state["simular_confirmacion_automatica"]:
+                        request["estado"] = "Notificada"
                     missing = request.get("datos_faltantes", [])
-                    request["estado"] = (
-                        "Notificada (datos pendientes)"
-                        if missing
-                        else "Notificada"
-                    )
                     print(
                         "[NOTIFICACIÓN SIMULADA] "
                         f"Para: {recipient} | Cliente: {request['cliente'] or 'No identificado'} | "
@@ -548,7 +580,6 @@ def build_graph(
                         )
                     )
                 else:
-                    request["estado"] = "Pendiente de asignación"
                     decision = "notificacion_pendiente"
                     reason = (
                         "No se pudo notificar porque no se encontró un PM responsable "
@@ -592,6 +623,8 @@ def build_graph(
         return {"hora_actual": state["hora_actual"] + 1}
 
     def check_pm_confirmation(state: AgentState) -> dict[str, Any]:
+        if not state["simular_confirmacion_automatica"]:
+            return {}
         requests_by_id = {
             request["id"]: {**request}
             for request in state["solicitudes"]

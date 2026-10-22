@@ -13,6 +13,7 @@ class AgentState(TypedDict):
     clasificacion_actual: list[dict[str, Any]]
     firmas_solicitudes: list[str]
     ids_solicitudes: list[str]
+    simular_confirmacion_automatica: bool
 
 
 def initial_agent_state() -> AgentState:
@@ -29,4 +30,5 @@ def initial_agent_state() -> AgentState:
         "clasificacion_actual": [],
         "firmas_solicitudes": [],
         "ids_solicitudes": [],
+        "simular_confirmacion_automatica": True,
     }

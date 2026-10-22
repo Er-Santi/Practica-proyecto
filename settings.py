@@ -25,6 +25,9 @@ HEARTBEAT_INTERVAL_SECONDS = 60
 AUDIT_PATH = Path("auditoria.jsonl")
 
 
+STATE_PATH = Path("estado_agente.json")
+
+
 ASSIGNMENTS_PATH = Path("asignacion.csv")
 
 
