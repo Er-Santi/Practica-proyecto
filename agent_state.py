@@ -14,6 +14,7 @@ class AgentState(TypedDict):
     firmas_solicitudes: list[str]
     ids_solicitudes: list[str]
     simular_confirmacion_automatica: bool
+    simulation_tick_only: bool
 
 
 def initial_agent_state() -> AgentState:
@@ -31,4 +32,5 @@ def initial_agent_state() -> AgentState:
         "firmas_solicitudes": [],
         "ids_solicitudes": [],
         "simular_confirmacion_automatica": True,
+        "simulation_tick_only": False,
     }

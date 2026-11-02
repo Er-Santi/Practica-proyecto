@@ -3,27 +3,32 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from agent_config import AgentConfig, load_agent_config
 from agent_state import AgentState, initial_agent_state
 from agentmail_client import AgentMailClient
 from audit_log import JsonlAuditLog, audit_error
 from email_utils import (
     _ordered_by_timestamp, clarification_questions, confirmation_question,
     extract_request_details, get_message_id, get_sender, infer_request_status,
-    load_assignments,
+    load_assignments, load_director_assignments,
     normalize_text, simulated_confirmation_delay,
 )
 from exceptions import AgentMailError, OpenRouterError
 from openrouter_client import OpenRouterClient
+from pm_assignment import count_open_projects
 from settings import (
     AUDIT_PATH,
     DEFAULT_RECONNECT_INTERVAL_SECONDS, DEFAULT_SIMULATION_SEED,
-    HEARTBEAT_INTERVAL_SECONDS, STATE_PATH, configured_max_llm_calls,
+    HEARTBEAT_INTERVAL_SECONDS, configured_max_llm_calls,
 )
-from state_store import AgentStateStoreError, load_agent_state, save_agent_state
+from reporting import build_sla_report
+from sla import FINAL_STATES, process_due_sla_actions
+from state_store import load_agent_state, save_agent_state
 from workflow import build_graph
 
 def apply_human_confirmation(
@@ -52,6 +57,7 @@ def apply_human_confirmation(
     if confirmed:
         request["estado"] = "Confirmada"
         request["fecha_confirmacion"] = datetime.now(timezone.utc).isoformat()
+        request["hora_confirmacion"] = state["hora_actual"]
     elif request["estado"] == "Confirmada":
         request["estado"] = "Notificada"
         request.pop("fecha_confirmacion", None)
@@ -133,6 +139,7 @@ def assign_pm_to_request(
     audit: JsonlAuditLog,
     pm_profiles: Mapping[str, Mapping[str, Any]] | None = None,
     simulation_seed: int = DEFAULT_SIMULATION_SEED,
+    config: AgentConfig | None = None,
 ) -> AgentState:
     if not pm_name.strip():
         raise ValueError("El nombre del PM no puede estar vacío.")
@@ -141,9 +148,26 @@ def assign_pm_to_request(
 
     request = state["solicitudes"][request_number - 1]
     pm_name = pm_name.strip()
+    agent_config = config or load_agent_config()
+    current_load = count_open_projects(
+        state["solicitudes"],
+        pm_name,
+        exclude_request_id=request["id"],
+    )
+    if current_load >= agent_config.max_open_projects_per_pm:
+        raise ValueError(
+            f"El PM {pm_name} ya tiene {current_load} proyectos abiertos; "
+            f"el límite es {agent_config.max_open_projects_per_pm}."
+        )
     request["pm_responsable"] = pm_name
     request["hora_notificacion"] = state["hora_actual"]
     request["fecha_notificacion"] = datetime.now(timezone.utc).isoformat()
+    request["recordatorio_enviado"] = False
+    request["escalado_director"] = False
+    request["nivel_maximo_escalamiento"] = "Ninguno"
+    request.pop("hora_recordatorio", None)
+    request.pop("fecha_recordatorio", None)
+    request.pop("hora_escalamiento_director", None)
     request["hora_confirmacion"] = None
     request.pop("confirmacion_usuario", None)
     request["confirmacion_simulada"] = False
@@ -192,6 +216,8 @@ def assign_pm_to_request(
         ),
         "datos": {
             "pm_responsable": pm_name,
+            "proyectos_abiertos": current_load + 1,
+            "limite_proyectos_abiertos": agent_config.max_open_projects_per_pm,
             "hora_notificacion": state["hora_actual"],
             "estado": request["estado"],
             "datos_faltantes": request["datos_faltantes"],
@@ -216,6 +242,7 @@ def apply_pm_update(
     audit: JsonlAuditLog,
     llm: OpenRouterClient | None,
     assignments: Mapping[str, str] | None = None,
+    config: AgentConfig | None = None,
 ) -> AgentState:
     if not 1 <= request_number <= len(state["solicitudes"]):
         raise IndexError("El número de solicitud está fuera de rango.")
@@ -226,8 +253,9 @@ def apply_pm_update(
     if not request.get("pm_responsable"):
         raise ValueError("Asigna un PM antes de registrar su respuesta.")
 
+    agent_config = config or load_agent_config()
     if llm is not None:
-        limit = configured_max_llm_calls()
+        limit = configured_max_llm_calls(agent_config.max_llm_calls)
         if limit and state["llamadas_llm"] >= limit:
             error = ValueError(
                 f"Se alcanzó MAX_LLM_CALLS={limit}; no se pudo interpretar "
@@ -281,6 +309,22 @@ def apply_pm_update(
             "estado",
         )
     }
+    proposed_pm = updates.get("pm_responsable")
+    if proposed_pm and normalize_text(str(proposed_pm)) != normalize_text(
+        str(request.get("pm_responsable") or "")
+    ):
+        current_load = count_open_projects(
+            state["solicitudes"],
+            str(proposed_pm),
+            exclude_request_id=request["id"],
+        )
+        if current_load >= agent_config.max_open_projects_per_pm:
+            error = ValueError(
+                f"El PM {proposed_pm} ya tiene {current_load} proyectos abiertos; "
+                f"el límite es {agent_config.max_open_projects_per_pm}."
+            )
+            _record_update_error(state, request, audit, error)
+            raise error
     for key in ("cliente", "rol", "cantidad_posiciones", "pm_responsable"):
         value = updates.get(key)
         if value is not None:
@@ -301,6 +345,10 @@ def apply_pm_update(
             raise error
         request["estado"] = status
         request["fecha_cambio_estado"] = datetime.now(timezone.utc).isoformat()
+        if status == "Escalada" and request.get(
+            "nivel_maximo_escalamiento", "Ninguno"
+        ) == "Ninguno":
+            request["nivel_maximo_escalamiento"] = "PM"
         if status == "Confirmada":
             request["fecha_confirmacion"] = request["fecha_cambio_estado"]
         elif status == "Cerrada":
@@ -381,68 +429,21 @@ def process_due_reminders(
     *,
     audit: JsonlAuditLog,
     now: datetime | None = None,
+    config: AgentConfig | None = None,
+    directors: Mapping[str, str] | None = None,
 ) -> int:
-    current_time = now or datetime.now(timezone.utc)
-    if current_time.tzinfo is None:
-        current_time = current_time.replace(tzinfo=timezone.utc)
-    reminders_sent = 0
-
-    for request in state["solicitudes"]:
-        if (
-            request.get("estado") in {"Confirmada", "Cerrada", "Escalada"}
-            or request.get("recordatorio_enviado")
-            or not request.get("pm_responsable")
-        ):
-            continue
-        received_at_text = request.get("fecha_recepcion")
-        if not isinstance(received_at_text, str):
-            continue
-        try:
-            received_at = datetime.fromisoformat(
-                received_at_text.replace("Z", "+00:00")
-            )
-        except ValueError as exc:
-            audit_error(
-                audit,
-                exc,
-                node="calcular_recordatorio",
-                hora_simulada=state["hora_actual"],
-                solicitud=request["id"],
-                details={"fecha_recepcion": received_at_text},
-            )
-            continue
-        if received_at.tzinfo is None:
-            received_at = received_at.replace(tzinfo=timezone.utc)
-        if current_time - received_at < timedelta(hours=24):
-            continue
-
-        request["estado"] = "Recordatorio enviado"
-        request["recordatorio_enviado"] = True
-        request["fecha_recordatorio"] = current_time.isoformat()
-        event = {
-            "hora_simulada": state["hora_actual"],
-            "solicitud": request["id"],
-            "nodo": "enviar_recordatorio_pm",
-            "decision": "recordatorio_enviado",
-            "motivo": (
-                "Se generó un recordatorio simulado al PM al cumplirse 24 horas "
-                "desde la recepción; no se envió correo real."
-            ),
-            "datos": {
-                "pm_responsable": request["pm_responsable"],
-                "fecha_recepcion": received_at.isoformat(),
-                "fecha_recordatorio": current_time.isoformat(),
-                "simulado": True,
-            },
-        }
-        audit.append(event)
-        state["eventos"].append(event)
-        print(
-            f"[RECORDATORIO SIMULADO] PM {request['pm_responsable']} | "
-            f"{request['asunto']} | solicitud {request['id']}"
-        )
-        reminders_sent += 1
-    return reminders_sent
+    return process_due_sla_actions(
+        state,
+        audit=audit,
+        config=config or load_agent_config(),
+        directors=(
+            directors
+            if directors is not None
+            else load_director_assignments()
+        ),
+        simulated=False,
+        now=now,
+    )
 
 
 def _record_update_error(
@@ -470,20 +471,115 @@ def run_phase_one(
     llm: OpenRouterClient | None = None,
     pm_profiles: Mapping[str, Mapping[str, Any]] | None = None,
     simulation_seed: int = DEFAULT_SIMULATION_SEED,
+    directors: Mapping[str, str] | None = None,
+    config: AgentConfig | None = None,
 ) -> AgentState:
     """Ejecuta un sondeo completo del StateGraph; el servicio vuelve a invocarlo."""
+    agent_config = config or load_agent_config()
+    agent_config = replace(
+        agent_config,
+        max_llm_calls=configured_max_llm_calls(agent_config.max_llm_calls),
+    )
     graph = build_graph(
         client,
         JsonlAuditLog(audit_path),
         assignments=assignments,
+        directors=directors,
         llm=llm,
         pm_profiles=pm_profiles,
         simulation_seed=simulation_seed,
+        config=agent_config,
     )
     return graph.invoke(
         state if state is not None else initial_agent_state(),
-        config={"recursion_limit": 16},
+        config={"recursion_limit": agent_config.recursion_limit},
     )
+
+
+def run_simulation(
+    client: AgentMailClient,
+    *,
+    audit_path: Path = AUDIT_PATH,
+    assignments: Mapping[str, str] | None = None,
+    directors: Mapping[str, str] | None = None,
+    llm: OpenRouterClient | None = None,
+    pm_profiles: Mapping[str, Mapping[str, Any]] | None = None,
+    simulation_seed: int = DEFAULT_SIMULATION_SEED,
+    config: AgentConfig | None = None,
+) -> dict[str, Any]:
+    agent_config = config or load_agent_config()
+    agent_config = replace(
+        agent_config,
+        max_llm_calls=configured_max_llm_calls(agent_config.max_llm_calls),
+    )
+    audit = JsonlAuditLog(audit_path)
+    graph = build_graph(
+        client,
+        audit,
+        assignments=assignments,
+        directors=directors,
+        llm=llm,
+        pm_profiles=pm_profiles,
+        simulation_seed=simulation_seed,
+        config=agent_config,
+    )
+    state = initial_agent_state()
+    state["simular_confirmacion_automatica"] = True
+    for tick in range(agent_config.max_simulated_hours):
+        state["simulation_tick_only"] = tick > 0
+        state = graph.invoke(
+            state,
+            config={"recursion_limit": agent_config.recursion_limit},
+        )
+        if all(
+            request.get("estado") in FINAL_STATES
+            for request in state["solicitudes"]
+        ):
+            break
+
+    requests_finished = bool(state["solicitudes"]) and all(
+        request.get("estado") in FINAL_STATES
+        for request in state["solicitudes"]
+    )
+    if requests_finished:
+        hours_simulated = max(0, state["hora_actual"] - 1)
+    elif not state["solicitudes"]:
+        hours_simulated = 0
+    else:
+        hours_simulated = state["hora_actual"]
+    report = build_sla_report(
+        state,
+        config=agent_config,
+        seed=simulation_seed,
+        llm_enabled=llm is not None,
+        hours_simulated=hours_simulated,
+    )
+    event = {
+        "hora_simulada": report["horas_simuladas"],
+        "solicitud": None,
+        "nodo": "reporte_final_sla",
+        "decision": "reporte_sla_generado",
+        "motivo": (
+            "La simulación terminó porque todas las solicitudes finalizaron."
+            if report["motivo_finalizacion"] == "todas_finalizadas"
+            else (
+                "La simulación no encontró solicitudes clasificadas."
+                if report["motivo_finalizacion"] == "sin_solicitudes"
+                else "La simulación alcanzó el máximo de horas configurado."
+            )
+        ),
+        "datos": {
+            "motivo_finalizacion": report["motivo_finalizacion"],
+            "horas_simuladas": report["horas_simuladas"],
+            "total_solicitudes": report["resumen_sla"]["total_solicitudes"],
+            "cumplieron_sla": report["resumen_sla"]["cumplieron"],
+            "no_cumplieron_sla": report["resumen_sla"]["no_cumplieron"],
+            "llamadas_llm": state["llamadas_llm"],
+        },
+    }
+    audit.append(event)
+    state["eventos"].append(event)
+    return report
 
 
 def run_agent_forever(
@@ -501,6 +597,8 @@ def run_agent_forever(
     state_lock: Any | None = None,
     state_path: Path | None = None,
     initial_state: AgentState | None = None,
+    directors: Mapping[str, str] | None = None,
+    config: AgentConfig | None = None,
 ) -> AgentState:
     """Load the existing inbox once, then process WebSocket events and deadlines."""
     if reconnect_interval <= 0:
@@ -508,13 +606,20 @@ def run_agent_forever(
     if heartbeat_interval <= 0:
         raise ValueError("heartbeat_interval debe ser mayor que cero.")
 
+    agent_config = config or load_agent_config()
+    agent_config = replace(
+        agent_config,
+        max_llm_calls=configured_max_llm_calls(agent_config.max_llm_calls),
+    )
     graph = build_graph(
         client,
         JsonlAuditLog(audit_path),
         assignments=assignments,
+        directors=directors,
         llm=llm,
         pm_profiles=pm_profiles,
         simulation_seed=simulation_seed,
+        config=agent_config,
     )
     audit = JsonlAuditLog(audit_path)
     state = (
@@ -524,10 +629,16 @@ def run_agent_forever(
         if state_path is not None
         else initial_agent_state()
     )
+    state["llamadas_llm"] = 0
     state["simular_confirmacion_automatica"] = False
     lock = state_lock or threading.RLock()
     next_heartbeat = time.monotonic() + heartbeat_interval
-    next_reminder_check = time.monotonic() + 60
+    reminder_interval = (
+        agent_config.sla_check_interval_seconds
+        if agent_config.testing_enabled
+        else 60
+    )
+    next_reminder_check = time.monotonic() + reminder_interval
 
     async def receive_events(
         event_queue: asyncio.Queue[dict[str, Any]],
@@ -575,7 +686,7 @@ def run_agent_forever(
                         "correos_evento": [message],
                         "simular_confirmacion_automatica": False,
                     },
-                    config={"recursion_limit": 16},
+                    config={"recursion_limit": agent_config.recursion_limit},
                 )
                 state["simular_confirmacion_automatica"] = False
                 save_state_locked()
@@ -642,7 +753,12 @@ def run_agent_forever(
 
     def check_reminders() -> int:
         with lock:
-            sent = process_due_reminders(state, audit=audit)
+            sent = process_due_reminders(
+                state,
+                audit=audit,
+                config=agent_config,
+                directors=directors,
+            )
             if sent:
                 save_state_locked()
                 on_state(state)
@@ -678,7 +794,7 @@ def run_agent_forever(
                             next_heartbeat = now + heartbeat_interval
                         if now >= next_reminder_check:
                             await asyncio.to_thread(check_reminders)
-                            next_reminder_check = now + 60
+                            next_reminder_check = now + reminder_interval
                         continue
 
                     if event.get("type") == "subscribed":
@@ -701,7 +817,7 @@ def run_agent_forever(
                                 f"la bandeja histórica: {exc}"
                             )
                         await asyncio.to_thread(check_reminders)
-                        next_reminder_check = time.monotonic() + 60
+                        next_reminder_check = time.monotonic() + reminder_interval
                         continue
                     if event.get("type") != "message_received":
                         print(
@@ -733,7 +849,7 @@ def run_agent_forever(
                         next_heartbeat = now + heartbeat_interval
                     if now >= next_reminder_check:
                         await asyncio.to_thread(check_reminders)
-                        next_reminder_check = now + 60
+                        next_reminder_check = now + reminder_interval
             except AgentMailError as exc:
                 if stop_event.is_set():
                     break

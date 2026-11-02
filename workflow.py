@@ -3,34 +3,55 @@ from typing import Any, Mapping
 
 from langgraph.graph import END, START, StateGraph
 
+from agent_config import AgentConfig, load_agent_config
 from agent_state import AgentState
 from agentmail_client import AgentMailClient
 from audit_log import JsonlAuditLog, audit_error
 from email_utils import (
     _ordered_by_timestamp, classify_by_rules, clarification_questions,
     confirmation_question, extract_request_details, get_message_id, get_sender,
-    infer_request_status, load_assignments, load_pm_profiles, message_text,
+    infer_request_status, load_assignments, load_director_assignments,
+    load_pm_profiles, message_text,
     normalize_text, request_fingerprint,
     simulated_confirmation_delay,
 )
 from exceptions import AgentMailError, OpenRouterError
 from openrouter_client import OpenRouterClient
-from settings import DEFAULT_SIMULATION_SEED, configured_max_llm_calls
+from settings import (
+    ASSIGNMENT_REPORT_PATH,
+    DEFAULT_SIMULATION_SEED,
+    configured_max_llm_calls,
+)
+from pm_assignment import select_least_loaded_pm
+from pm_assignment import count_open_projects
+from sla import process_due_sla_actions
 
 def build_graph(
     client: AgentMailClient,
     audit: JsonlAuditLog,
     *,
     assignments: Mapping[str, str] | None = None,
+    directors: Mapping[str, str] | None = None,
     llm: OpenRouterClient | None = None,
     pm_profiles: Mapping[str, Mapping[str, Any]] | None = None,
     simulation_seed: int = DEFAULT_SIMULATION_SEED,
+    config: AgentConfig | None = None,
 ):
-    llm_call_limit = configured_max_llm_calls()
+    agent_config = config or load_agent_config()
+    llm_call_limit = configured_max_llm_calls(agent_config.max_llm_calls)
     pm_by_client = (
         {normalize_text(str(client)): str(pm) for client, pm in assignments.items()}
         if assignments is not None
         else load_assignments()
+    )
+    director_by_client = (
+        {normalize_text(str(client)): str(director) for client, director in directors.items()}
+        if directors is not None
+        else load_director_assignments()
+    )
+    pm_roster = tuple(sorted(set(pm_by_client.values()), key=str.casefold))
+    assignment_issue_report = JsonlAuditLog(
+        audit.path.with_name(ASSIGNMENT_REPORT_PATH.name)
     )
     profiles_by_pm = (
         {
@@ -63,6 +84,13 @@ def build_graph(
         return event
 
     def read_inbox(state: AgentState) -> dict[str, Any]:
+        if state.get("simulation_tick_only"):
+            return {
+                "correos_nuevos": [],
+                "simulation_tick_only": False,
+                "correos_evento": [],
+                "clasificacion_actual": [],
+            }
         event_messages = state.get("correos_evento", [])
         if event_messages:
             processed = set(state["correos_procesados"])
@@ -260,10 +288,45 @@ def build_graph(
                             "estado",
                         )
                     }
-                    for key in ("cliente", "rol", "cantidad_posiciones", "pm_responsable"):
+                    for key in ("cliente", "rol", "cantidad_posiciones"):
                         value = llm_result.get(key) if llm_result else None
                         if value is not None:
                             target_request[key] = value
+                    proposed_pm = (
+                        llm_result.get("pm_responsable")
+                        if llm_result
+                        else None
+                    )
+                    if proposed_pm and normalize_text(str(proposed_pm)) != normalize_text(
+                        str(target_request.get("pm_responsable") or "")
+                    ):
+                        pm_load = count_open_projects(
+                            requests_found,
+                            str(proposed_pm),
+                            exclude_request_id=target_request["id"],
+                        )
+                        if pm_load < agent_config.max_open_projects_per_pm:
+                            target_request["pm_responsable"] = str(proposed_pm)
+                        else:
+                            events.append(
+                                record(
+                                    state,
+                                    identifier=identifier,
+                                    node="actualizar_solicitud_desde_correo",
+                                    decision="asignacion_pm_rechazada_por_limite",
+                                    reason=(
+                                        f"Se rechazó asignar al PM {proposed_pm}: "
+                                        f"ya tiene {pm_load} proyectos abiertos."
+                                    ),
+                                    details={
+                                        "pm_responsable": proposed_pm,
+                                        "proyectos_abiertos": pm_load,
+                                        "limite_proyectos_abiertos": (
+                                            agent_config.max_open_projects_per_pm
+                                        ),
+                                    },
+                                )
+                            )
                     if llm_result and llm_result.get("posiciones"):
                         target_request["posiciones"] = llm_result["posiciones"]
                         if target_request.get("cantidad_posiciones") is None:
@@ -281,9 +344,14 @@ def build_graph(
                         not target_request.get("pm_responsable")
                         and target_request.get("cliente")
                     ):
-                        target_request["pm_responsable"] = pm_by_client.get(
-                            normalize_text(target_request["cliente"])
+                        selected_pm, _ = select_least_loaded_pm(
+                            requests_found,
+                            pm_roster,
+                            maximum_open_projects=(
+                                agent_config.max_open_projects_per_pm
+                            ),
                         )
+                        target_request["pm_responsable"] = selected_pm
                     target_request["datos_faltantes"] = [
                         field
                         for field, value in (
@@ -311,10 +379,20 @@ def build_graph(
                             "cerrada": "Cerrada",
                         }
                         target_request["estado"] = state_labels[reported_status]
+                        if (
+                            reported_status == "escalada"
+                            and target_request.get(
+                                "nivel_maximo_escalamiento",
+                                "Ninguno",
+                            )
+                            == "Ninguno"
+                        ):
+                            target_request["nivel_maximo_escalamiento"] = "PM"
                         target_request["fecha_cambio_estado"] = datetime.now(
                             timezone.utc
                         ).isoformat()
                         if reported_status == "confirmada":
+                            target_request["hora_confirmacion"] = state["hora_actual"]
                             target_request["fecha_confirmacion"] = (
                                 target_request["fecha_cambio_estado"]
                             )
@@ -400,6 +478,74 @@ def build_graph(
                         details["pm_responsable"] = pm_by_client.get(
                             normalize_text(details["cliente"])
                         )
+                selected_pm, pm_loads = select_least_loaded_pm(
+                    requests_found,
+                    pm_roster,
+                    maximum_open_projects=agent_config.max_open_projects_per_pm,
+                )
+                details["pm_responsable"] = selected_pm
+                details["datos_faltantes"] = [
+                    key
+                    for key, value in (
+                        ("cliente", details["cliente"]),
+                        ("rol", details["rol"]),
+                        ("cantidad_posiciones", details["cantidad_posiciones"]),
+                        ("pm_responsable", selected_pm),
+                    )
+                    if value is None
+                ]
+                details["asignacion_automatica"] = {
+                    "pm_asignado": selected_pm,
+                    "cargas_abiertas": pm_loads,
+                    "limite_proyectos_abiertos": (
+                        agent_config.max_open_projects_per_pm
+                    ),
+                }
+                if selected_pm is None:
+                    issue_event = record(
+                        state,
+                        identifier=identifier,
+                        node="asignacion_automatica_pm",
+                        decision="sin_pm_disponible",
+                        reason=(
+                            "No hay PM configurado con menos de "
+                            f"{agent_config.max_open_projects_per_pm} proyectos "
+                            "abiertos; la solicitud queda pendiente de asignación."
+                        ),
+                        details={
+                            "cliente": details["cliente"],
+                            "cargas_abiertas": pm_loads,
+                            "limite_proyectos_abiertos": (
+                                agent_config.max_open_projects_per_pm
+                            ),
+                            "asignacion_reportada_en": str(
+                                assignment_issue_report.path
+                            ),
+                        },
+                    )
+                    assignment_issue_report.append(issue_event)
+                    events.append(issue_event)
+                    print(
+                        "[SIN PM DISPONIBLE] "
+                        f"{email.get('subject') or identifier}. "
+                        "Se escribió un reporte en "
+                        f"{assignment_issue_report.path}."
+                    )
+                else:
+                    events.append(
+                        record(
+                            state,
+                            identifier=identifier,
+                            node="asignacion_automatica_pm",
+                            decision="pm_asignado_automaticamente",
+                            reason=(
+                                f"Se asignó al PM con menor carga abierta "
+                                f"({pm_loads[selected_pm]} de "
+                                f"{agent_config.max_open_projects_per_pm})."
+                            ),
+                            details=details["asignacion_automatica"],
+                        )
+                    )
                     details["datos_faltantes"] = [
                         key
                         for key, value in (
@@ -460,6 +606,8 @@ def build_graph(
                         "hora_confirmacion": None,
                         "confirmacion_usuario": None,
                         "estado": "Nueva",
+                        "nivel_maximo_escalamiento": "Ninguno",
+                        "escalado_director": False,
                         "hora_notificacion": None,
                         "fecha_recepcion": (
                             str(
@@ -633,7 +781,14 @@ def build_graph(
 
         for request in requests_by_id.values():
             if (
-                not request["estado"].startswith("Notificada")
+                (
+                    request["estado"]
+                    not in {"Notificada", "Recordatorio enviado"}
+                    and not (
+                        request["estado"] == "Escalada"
+                        and request.get("escalado_director", False)
+                    )
+                )
                 or request.get("confirmacion_usuario") is not None
                 or request.get("datos_faltantes")
             ):
@@ -653,7 +808,10 @@ def build_graph(
 
             if delay is None:
                 continue
-            elapsed_hours = state["hora_actual"] - request["hora_notificacion"]
+            notification_hour = request.get("hora_notificacion")
+            if not isinstance(notification_hour, (int, float)):
+                continue
+            elapsed_hours = state["hora_actual"] - notification_hour
             if elapsed_hours < delay:
                 continue
 
@@ -687,16 +845,30 @@ def build_graph(
             "eventos": [*state["eventos"], *events],
         }
 
+    def apply_sla_thresholds(state: AgentState) -> dict[str, Any]:
+        if not state["simular_confirmacion_automatica"]:
+            return {}
+        process_due_sla_actions(
+            state,
+            audit=audit,
+            config=agent_config,
+            directors=director_by_client,
+            simulated=True,
+        )
+        return {}
+
     workflow = StateGraph(AgentState)
     workflow.add_node("leer_bandeja", read_inbox)
     workflow.add_node("clasificar_por_reglas", classify_emails)
     workflow.add_node("notificar_pm_simulado", notify_pm_simulated)
     workflow.add_node("consultar_confirmacion_pm", check_pm_confirmation)
+    workflow.add_node("aplicar_umbrales_sla", apply_sla_thresholds)
     workflow.add_node("avanzar_reloj", advance_clock)
     workflow.add_edge(START, "leer_bandeja")
     workflow.add_edge("leer_bandeja", "clasificar_por_reglas")
     workflow.add_edge("clasificar_por_reglas", "notificar_pm_simulado")
     workflow.add_edge("notificar_pm_simulado", "consultar_confirmacion_pm")
-    workflow.add_edge("consultar_confirmacion_pm", "avanzar_reloj")
+    workflow.add_edge("consultar_confirmacion_pm", "aplicar_umbrales_sla")
+    workflow.add_edge("aplicar_umbrales_sla", "avanzar_reloj")
     workflow.add_edge("avanzar_reloj", END)
     return workflow.compile()

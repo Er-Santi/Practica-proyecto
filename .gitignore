@@ -3,3 +3,5 @@ __pycache__/
 .pytest_cache/
 auditoria.jsonl
 estado_agente.json
+reporte_sla.json
+reporte_asignacion.jsonl

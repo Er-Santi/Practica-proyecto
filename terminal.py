@@ -5,12 +5,19 @@ from typing import Any, Mapping
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from agent_state import AgentState, initial_agent_state
+from agent_config import AgentConfig, load_agent_config
+from agent_state import AgentState
 from agentmail_client import AgentMailClient
 from audit_log import JsonlAuditLog, audit_error
-from email_utils import get_message_id, get_sender, normalize_text
+from email_utils import (
+    get_message_id,
+    get_sender,
+    load_director_assignments,
+    normalize_text,
+)
 from exceptions import AgentMailError, OpenRouterError
 from openrouter_client import OpenRouterClient
+from pm_assignment import count_open_projects
 from service import (
     apply_human_confirmation,
     apply_pm_update,
@@ -109,7 +116,13 @@ def run_terminal_agent(
     pm_profiles: Mapping[str, Mapping[str, Any]] | None = None,
     simulation_seed: int = DEFAULT_SIMULATION_SEED,
     state_path: Path = STATE_PATH,
+    config: AgentConfig | None = None,
+    directors: Mapping[str, str] | None = None,
 ) -> None:
+    agent_config = config or load_agent_config()
+    director_contacts = (
+        directors if directors is not None else load_director_assignments()
+    )
     stop_event = threading.Event()
     state_lock = threading.RLock()
     state_snapshot = load_agent_state(state_path)
@@ -188,12 +201,14 @@ def run_terminal_agent(
                 on_state=store_state,
                 reconnect_interval=reconnect_interval,
                 assignments=assignments,
+                directors=director_contacts,
                 llm=llm,
                 pm_profiles=pm_profiles,
                 simulation_seed=simulation_seed,
                 state_lock=state_lock,
                 state_path=state_path,
                 initial_state=state_snapshot,
+                config=agent_config,
             )
         except Exception as exc:
             _audit_terminal_error(audit_path, "ejecutar_agente", exc)
@@ -266,6 +281,27 @@ def run_terminal_agent(
                         f"Finalizadas: {sum(request['estado'] in {'Confirmada', 'Cerrada'} for request in state['solicitudes'])} | "
                         f"Llamadas OpenRouter: {llm_usage}"
                     )
+                    pm_roster = sorted(
+                        set((assignments or {}).values()),
+                        key=str.casefold,
+                    )
+                    if pm_roster:
+                        print("Carga abierta por PM:")
+                        for pm_name in pm_roster:
+                            open_projects = count_open_projects(
+                                state["solicitudes"],
+                                pm_name,
+                            )
+                            print(
+                                f"  {pm_name}: {open_projects}/"
+                                f"{agent_config.max_open_projects_per_pm}"
+                            )
+                    else:
+                        print(
+                            "No hay PM configurados en asignacion.csv; "
+                            f"el límite por PM es "
+                            f"{agent_config.max_open_projects_per_pm}."
+                        )
                     for index, request in enumerate(state["solicitudes"], start=1):
                         if request["estado"] in {"Confirmada", "Cerrada"}:
                             continue
@@ -330,6 +366,7 @@ def run_terminal_agent(
                                 audit=JsonlAuditLog(audit_path),
                                 pm_profiles=pm_profiles,
                                 simulation_seed=simulation_seed,
+                                config=agent_config,
                             )
                         persist_state()
                     except (IndexError, ValueError) as exc:
@@ -367,6 +404,7 @@ def run_terminal_agent(
                                 audit=JsonlAuditLog(audit_path),
                                 llm=llm,
                                 assignments=assignments,
+                                config=agent_config,
                             )
                         persist_state()
                     except (IndexError, OpenRouterError, ValueError) as exc:

@@ -1,0 +1,21 @@
+sla:
+  reminder_after_hours: 4
+  escalate_after_hours: 8
+  target_hours: 8
+
+simulation:
+  max_hours: 48
+  recursion_limit: 16
+
+llm:
+  max_calls: 60
+
+assignment:
+  max_open_projects_per_pm: 10
+
+testing:
+  enabled: true
+  reminder_after_minutes: 1
+  escalate_after_minutes: 2
+  sla_target_minutes: 3
+  check_interval_seconds: 5

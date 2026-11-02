@@ -10,7 +10,10 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 REQUEST_TIMEOUT_SECONDS = 20
 
 
-MAX_LLM_CALLS = 0
+HARD_MAX_LLM_CALLS = 60
+
+
+MAX_LLM_CALLS = HARD_MAX_LLM_CALLS
 
 
 OPENROUTER_DEFAULT_MODEL = "openai/gpt-4o-mini"
@@ -23,6 +26,12 @@ HEARTBEAT_INTERVAL_SECONDS = 60
 
 
 AUDIT_PATH = Path("auditoria.jsonl")
+
+
+CONFIG_PATH = Path("config.yaml")
+
+
+ASSIGNMENT_REPORT_PATH = Path("reporte_asignacion.jsonl")
 
 
 STATE_PATH = Path("estado_agente.json")
@@ -105,12 +114,22 @@ HIRING_ROLE_MARKERS = (
 )
 
 
-def configured_max_llm_calls() -> int:
-    raw_value = os.environ.get("MAX_LLM_CALLS", str(MAX_LLM_CALLS)).strip()
+def configured_max_llm_calls(configured_limit: int = MAX_LLM_CALLS) -> int:
+    if not 1 <= configured_limit <= HARD_MAX_LLM_CALLS:
+        raise ValueError(
+            f"El límite de llamadas debe estar entre 1 y {HARD_MAX_LLM_CALLS}."
+        )
+    raw_value = os.environ.get("MAX_LLM_CALLS")
+    if raw_value is None or not raw_value.strip() or raw_value.strip() == "0":
+        return configured_limit
     try:
         limit = int(raw_value)
     except ValueError as exc:
-        raise ValueError("MAX_LLM_CALLS debe ser un entero mayor o igual que cero.") from exc
-    if limit < 0:
-        raise ValueError("MAX_LLM_CALLS debe ser un entero mayor o igual que cero.")
-    return limit
+        raise ValueError(
+            f"MAX_LLM_CALLS debe ser 0 o un entero entre 1 y {HARD_MAX_LLM_CALLS}."
+        ) from exc
+    if not 0 <= limit <= HARD_MAX_LLM_CALLS:
+        raise ValueError(
+            f"MAX_LLM_CALLS debe ser 0 o un entero entre 1 y {HARD_MAX_LLM_CALLS}."
+        )
+    return configured_limit if limit == 0 else min(limit, configured_limit)

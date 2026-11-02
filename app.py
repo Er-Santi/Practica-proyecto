@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
 from agentmail import AsyncAgentMail
+from agent_config import AgentConfig, load_agent_config
 from agent_state import AgentState, initial_agent_state
 from agentmail_client import AgentMailClient, serialize_agentmail_message
 from audit_log import JsonlAuditLog, audit_error
@@ -24,6 +27,7 @@ from email_utils import (
     get_message_id,
     get_sender,
     load_assignments,
+    load_director_assignments,
     load_pm_profiles,
     message_text,
     normalize_text,
@@ -41,11 +45,14 @@ from service import (
     process_due_reminders,
     run_agent_forever,
     run_phase_one,
+    run_simulation,
 )
 from settings import (
     API_BASE_URL,
+    ASSIGNMENT_REPORT_PATH,
     ASSIGNMENTS_PATH,
     AUDIT_PATH,
+    CONFIG_PATH,
     DEFAULT_RECONNECT_INTERVAL_SECONDS,
     DEFAULT_SIMULATION_SEED,
     HEARTBEAT_INTERVAL_SECONDS,
@@ -57,6 +64,7 @@ from settings import (
     STATE_PATH,
     configured_max_llm_calls,
 )
+from reporting import write_sla_report
 from state_store import AgentStateStoreError
 from terminal import run_terminal_agent
 from workflow import build_graph
@@ -64,9 +72,12 @@ from workflow import build_graph
 __all__ = [
     "API_BASE_URL",
     "ASSIGNMENTS_PATH",
+    "ASSIGNMENT_REPORT_PATH",
     "AUDIT_PATH",
+    "CONFIG_PATH",
     "AgentMailClient",
     "AgentMailError",
+    "AgentConfig",
     "AgentState",
     "AsyncAgentMail",
     "DEFAULT_RECONNECT_INTERVAL_SECONDS",
@@ -97,6 +108,8 @@ __all__ = [
     "get_sender",
     "initial_agent_state",
     "load_assignments",
+    "load_agent_config",
+    "load_director_assignments",
     "load_pm_profiles",
     "mark_request_opened",
     "process_due_reminders",
@@ -106,16 +119,21 @@ __all__ = [
     "requests",
     "run_agent_forever",
     "run_phase_one",
+    "run_simulation",
     "run_terminal_agent",
     "serialize_agentmail_message",
     "simulated_confirmation_delay",
+    "write_sla_report",
 ]
 
 
 def main() -> int:
     load_dotenv()
     parser = argparse.ArgumentParser(
-        description="Agente LangGraph continuo para leer y clasificar correos de AgentMail."
+        description=(
+            "Agente LangGraph para leer y clasificar AgentMail, con modo "
+            "de simulación SLA acotado."
+        )
     )
     parser.add_argument(
         "--reconnect-seconds",
@@ -142,6 +160,23 @@ def main() -> int:
         type=Path,
         default=STATE_PATH,
         help="ruta del estado persistente de solicitudes (por defecto estado_agente.json)",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=CONFIG_PATH,
+        help="umbrales SLA y límites de la corrida (por defecto config.yaml)",
+    )
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="simula la bandeja hasta finalizar las solicitudes o alcanzar el límite",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=Path("reporte_sla.json"),
+        help="ruta del reporte final JSON en modo --simulate",
     )
     parser.add_argument(
         "--assignments",
@@ -192,8 +227,13 @@ def main() -> int:
             raise ValueError(
                 "OpenRouter está activado; configura OPENROUTER_API_KEY en .env."
             )
-        llm_call_limit = configured_max_llm_calls()
+        agent_config = load_agent_config(args.config)
+        agent_config = replace(
+            agent_config,
+            max_llm_calls=configured_max_llm_calls(agent_config.max_llm_calls),
+        )
         assignments = load_assignments(args.assignments)
+        directors = load_director_assignments(args.assignments)
         pm_profiles = load_pm_profiles(args.profiles)
         client = AgentMailClient(api_key, inbox_id)
         llm = OpenRouterClient(openrouter_key, args.model) if use_llm else None
@@ -206,22 +246,62 @@ def main() -> int:
         print(f"No se pudo conectar con AgentMail: {exc}")
         return 1
 
-    print(f"Conectando por WebSocket al inbox de AgentMail: {inbox_id}")
+    if args.simulate:
+        print(f"Usando la bandeja AgentMail para la simulación: {inbox_id}")
+    else:
+        print(f"Conectando por WebSocket al inbox de AgentMail: {inbox_id}")
     if llm is not None:
         print(
             f"Clasificación con OpenRouter activada: {args.model}. "
             "Cada correo nuevo se interpretará con el modelo; sus respuestas y "
             "contenido se envían al proveedor configurado."
         )
-        if llm_call_limit:
-            print(f"Límite configurado de llamadas OpenRouter: {llm_call_limit}.")
-        else:
-            print(
-                "Llamadas OpenRouter sin límite predeterminado; define "
-                "MAX_LLM_CALLS en .env para limitar el consumo."
-            )
+        print(
+            "Límite de llamadas OpenRouter por corrida: "
+            f"{agent_config.max_llm_calls}."
+        )
     else:
         print("OpenRouter está desactivado; se utilizarán las reglas de respaldo.")
+    if agent_config.testing_enabled:
+        print(
+            "Modo de prueba SLA activo: recordatorio a los "
+            f"{agent_config.test_reminder_after_minutes} min, escalamiento a los "
+            f"{agent_config.test_escalate_after_minutes} min, objetivo SLA "
+            f"{agent_config.test_sla_target_minutes} min; comprobación cada "
+            f"{agent_config.sla_check_interval_seconds} s."
+        )
+    else:
+        print(
+            "Modo SLA normal: recordatorio a las "
+            f"{agent_config.reminder_after_hours} h y escalamiento a las "
+            f"{agent_config.escalate_after_hours} h."
+        )
+
+    if args.simulate:
+        try:
+            report = run_simulation(
+                client,
+                audit_path=args.audit,
+                assignments=assignments,
+                directors=directors,
+                llm=llm,
+                pm_profiles=pm_profiles,
+                simulation_seed=args.seed,
+                config=agent_config,
+            )
+            write_sla_report(args.report, report)
+        except (AgentMailError, OSError, ValueError) as exc:
+            audit_error(audit, exc, node="ejecutar_simulacion_sla")
+            print(f"No se pudo completar la simulación: {exc}")
+            return 1
+        print(
+            f"Simulación terminada: {report['motivo_finalizacion']} "
+            f"tras {report['horas_simuladas']} horas simuladas."
+        )
+        print(f"Reporte SLA: {args.report}")
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
     print(
         "Confirmación de PM simulada por perfil; puedes validar o corregir "
         "cada solicitud con `confirm <n> sí|no`."
@@ -236,6 +316,8 @@ def main() -> int:
             pm_profiles=pm_profiles,
             simulation_seed=args.seed,
             state_path=args.state,
+            config=agent_config,
+            directors=directors,
         )
     except KeyboardInterrupt:
         print("\nAgente detenido.")

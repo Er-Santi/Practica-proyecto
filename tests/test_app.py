@@ -2,7 +2,7 @@ import asyncio
 import json
 import sys
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -10,7 +10,9 @@ from unittest.mock import Mock
 import pytest
 from agentmail import MessageReceivedEvent, Subscribed
 
+from agent_config import AgentConfig, load_agent_config
 from app import (
+    ASSIGNMENT_REPORT_PATH,
     AgentMailClient,
     AgentStateStoreError,
     JsonlAuditLog,
@@ -26,16 +28,19 @@ from app import (
     get_sender,
     initial_agent_state,
     load_assignments,
+    load_director_assignments,
     load_pm_profiles,
     main,
     mark_request_opened,
     request_fingerprint,
     run_agent_forever,
     run_phase_one,
+    run_simulation,
     process_due_reminders,
     simulated_confirmation_delay,
+    write_sla_report,
 )
-from state_store import load_agent_state, save_agent_state
+from state_store import load_agent_state
 
 
 def make_message(
@@ -749,10 +754,10 @@ def test_openrouter_budget_falls_back_to_rules(
     assert "límite de 60 llamadas" in event["motivo"]
 
 
-def test_llm_call_limit_defaults_to_unlimited(monkeypatch) -> None:
+def test_llm_call_limit_defaults_to_configured_hard_cap(monkeypatch) -> None:
     monkeypatch.delenv("MAX_LLM_CALLS", raising=False)
 
-    assert configured_max_llm_calls() == 0
+    assert configured_max_llm_calls() == 60
 
 
 def test_openrouter_is_enabled_by_default_and_config_errors_are_audited(
@@ -779,7 +784,44 @@ def test_openrouter_is_enabled_by_default_and_config_errors_are_audited(
     assert event["nodo"] == "validar_configuracion"
 
 
-@pytest.mark.parametrize("value", ["-1", "unlimited"])
+def test_cli_simulation_writes_final_sla_report(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    report_path = tmp_path / "final-report.json"
+    report = {
+        "modo": "sin_llm",
+        "motivo_finalizacion": "sin_solicitudes",
+        "horas_simuladas": 0,
+        "solicitudes": [],
+    }
+    simulate = Mock(return_value=report)
+    monkeypatch.setattr("app.load_dotenv", lambda: None)
+    monkeypatch.setattr("app.AgentMailClient", Mock(return_value=Mock()))
+    monkeypatch.setattr("app.run_simulation", simulate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "app.py",
+            "--simulate",
+            "--report",
+            str(report_path),
+            "--audit",
+            str(tmp_path / "audit.jsonl"),
+        ],
+    )
+    monkeypatch.setenv("AGENTMAIL_API_KEY", "test-agentmail-key")
+    monkeypatch.setenv("AGENTMAIL_INBOX_ID", "inbox@example.test")
+    monkeypatch.setenv("USE_LLM", "false")
+
+    assert main() == 0
+    assert json.loads(report_path.read_text(encoding="utf-8")) == report
+    assert "Reporte SLA:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["-1", "61", "unlimited"])
 def test_llm_call_limit_rejects_invalid_values(monkeypatch, value: str) -> None:
     monkeypatch.setenv("MAX_LLM_CALLS", value)
 
@@ -843,6 +885,116 @@ def test_rf03_rf04_rf10_extract_assign_notify_and_audit(tmp_path: Path) -> None:
     )
 
 
+def test_new_request_goes_to_pm_with_fewest_open_projects(tmp_path: Path) -> None:
+    state = initial_agent_state()
+    state["solicitudes"] = [
+        {
+            "id": "existing-1",
+            "estado": "Notificada",
+            "pm_responsable": "PM Ana",
+            "hora_notificacion": 0,
+        }
+    ]
+    request_email = make_message(
+        "new-1",
+        "Solicitud de personal",
+        "Cliente: Acme\nRol: Analista\nCantidad: 1",
+    )
+
+    result = run_phase_one(
+        FakeAgentMailClient([[request_email]]),
+        audit_path=tmp_path / "audit.jsonl",
+        state=state,
+        assignments={"Acme": "PM Ana", "Beta": "PM Luis"},
+        config=AgentConfig(testing_enabled=False),
+    )
+
+    assert result["solicitudes"][1]["pm_responsable"] == "PM Luis"
+    assignment_event = next(
+        event
+        for event in result["eventos"]
+        if event.get("decision") == "pm_asignado_automaticamente"
+    )
+    assert assignment_event["datos"]["cargas_abiertas"] == {
+        "PM Ana": 1,
+        "PM Luis": 0,
+    }
+
+
+def test_no_pm_available_writes_assignment_problem_report(tmp_path: Path) -> None:
+    messages = [
+        make_message(
+            "req-1",
+            "Solicitud de personal",
+            "Cliente: Acme\nRol: Analista\nCantidad: 1",
+        ),
+        make_message(
+            "req-2",
+            "Solicitud de personal",
+            "Cliente: Beta\nRol: Ingeniero\nCantidad: 1",
+        ),
+        make_message(
+            "req-3",
+            "Solicitud de personal",
+            "Cliente: Gamma\nRol: Tester\nCantidad: 1",
+        ),
+    ]
+    audit_path = tmp_path / "audit.jsonl"
+
+    result = run_phase_one(
+        FakeAgentMailClient([messages]),
+        audit_path=audit_path,
+        assignments={"Acme": "PM Ana", "Beta": "PM Luis", "Gamma": "PM Ana"},
+        config=AgentConfig(
+            max_open_projects_per_pm=1,
+            testing_enabled=False,
+        ),
+    )
+
+    assert [request["pm_responsable"] for request in result["solicitudes"]] == [
+        "PM Ana",
+        "PM Luis",
+        None,
+    ]
+    assignment_report = tmp_path / ASSIGNMENT_REPORT_PATH.name
+    issue = json.loads(assignment_report.read_text(encoding="utf-8").splitlines()[0])
+    assert issue["decision"] == "sin_pm_disponible"
+    assert issue["solicitud"] == "req-3"
+    assert issue["datos"]["cargas_abiertas"] == {"PM Ana": 1, "PM Luis": 1}
+    assert issue["datos"]["limite_proyectos_abiertos"] == 1
+
+
+def test_manual_pm_assignment_cannot_exceed_open_project_cap(tmp_path: Path) -> None:
+    state = initial_agent_state()
+    state["solicitudes"] = [
+        {
+            "id": f"open-{index}",
+            "estado": "Notificada",
+            "pm_responsable": "PM Ana",
+        }
+        for index in range(10)
+    ]
+    state["solicitudes"].append(
+        {
+            "id": "new",
+            "asunto": "Nueva solicitud",
+            "cliente": "Acme",
+            "rol": "Analista",
+            "cantidad_posiciones": 1,
+            "estado": "Nueva",
+        }
+    )
+
+    with pytest.raises(ValueError, match="límite es 10"):
+        assign_pm_to_request(
+            state,
+            request_number=11,
+            pm_name="PM Ana",
+            audit=JsonlAuditLog(tmp_path / "audit.jsonl"),
+            config=AgentConfig(),
+        )
+
+
 def test_missing_pm_is_audited_as_pending_not_as_notified(tmp_path: Path) -> None:
     message = make_message(
         "m1",
@@ -853,6 +1005,7 @@ def test_missing_pm_is_audited_as_pending_not_as_notified(tmp_path: Path) -> Non
     result = run_phase_one(
         FakeAgentMailClient([[message]]),
         audit_path=tmp_path / "auditoria.jsonl",
+        assignments={},
     )
 
     assert result["solicitudes"][0]["pm_responsable"] is None
@@ -1099,8 +1252,10 @@ def test_service_remains_idle_without_polling_until_stopped(
 ) -> None:
     stop_event = threading.Event()
     client = FakeAgentMailClient([], stop_event=stop_event)
-    timer = threading.Timer(0.03, stop_event.set)
+    timer = threading.Timer(0.2, stop_event.set)
     timer.start()
+    initial_state = initial_agent_state()
+    initial_state["llamadas_llm"] = 59
 
     def publish(state) -> None:
         assert isinstance(state["hora_actual"], int)
@@ -1111,12 +1266,14 @@ def test_service_remains_idle_without_polling_until_stopped(
         stop_event=stop_event,
         on_state=publish,
         heartbeat_interval=60,
+        initial_state=initial_state,
     )
     timer.join()
 
     assert client.list_calls == 1
     assert client.stream_calls == 1
     assert result["correos_procesados"] == []
+    assert result["llamadas_llm"] == 0
     assert not (tmp_path / "audit.jsonl").exists()
 
 
@@ -1184,7 +1341,7 @@ def test_service_backfills_old_messages_and_restores_active_state(
     assert restored["solicitudes"][0]["id"] == "old-1"
 
 
-def test_due_reminder_is_sent_once_after_24_hours(tmp_path: Path) -> None:
+def test_due_reminder_is_sent_once_after_configured_four_hours(tmp_path: Path) -> None:
     message = make_message(
         "m1",
         "Solicitud de personal",
@@ -1197,12 +1354,15 @@ def test_due_reminder_is_sent_once_after_24_hours(tmp_path: Path) -> None:
         assignments={"Acme": "PM Ana"},
     )
     request = state["solicitudes"][0]
-    received_at = datetime.fromisoformat(request["fecha_recepcion"].replace("Z", "+00:00"))
-    reminder_time = received_at.replace(tzinfo=timezone.utc) + timedelta(hours=24)
+    notified_at = datetime.fromisoformat(
+        request["fecha_notificacion"].replace("Z", "+00:00")
+    )
+    reminder_time = notified_at + timedelta(hours=4)
 
     sent = process_due_reminders(
         state,
         audit=JsonlAuditLog(audit_path),
+        config=AgentConfig(testing_enabled=False),
         now=reminder_time,
     )
 
@@ -1211,6 +1371,7 @@ def test_due_reminder_is_sent_once_after_24_hours(tmp_path: Path) -> None:
     assert process_due_reminders(
         state,
         audit=JsonlAuditLog(audit_path),
+        config=AgentConfig(testing_enabled=False),
         now=reminder_time + timedelta(hours=1),
     ) == 0
     events = [
@@ -1218,7 +1379,325 @@ def test_due_reminder_is_sent_once_after_24_hours(tmp_path: Path) -> None:
         for line in audit_path.read_text(encoding="utf-8").splitlines()
     ]
     reminder = next(event for event in events if event["decision"] == "recordatorio_enviado")
-    assert reminder["datos"]["simulado"] is True
+    assert reminder["datos"]["reloj_simulado"] is False
+    assert reminder["datos"]["notificacion_simulada"] is True
+    assert reminder["datos"]["umbral"] == 4
+
+
+def test_testing_sla_uses_one_and_two_minute_thresholds(tmp_path: Path) -> None:
+    request = {
+        "id": "m-test",
+        "asunto": "Solicitud de prueba",
+        "cliente": "Acme",
+        "pm_responsable": "PM Ana",
+        "estado": "Notificada",
+        "fecha_notificacion": "2026-10-29T12:00:00+00:00",
+        "hora_notificacion": 0,
+        "recordatorio_enviado": False,
+        "escalado_director": False,
+    }
+    state = initial_agent_state()
+    state["solicitudes"] = [request]
+    audit = JsonlAuditLog(tmp_path / "audit.jsonl")
+    config = AgentConfig(testing_enabled=True)
+
+    reminder_actions = process_due_reminders(
+        state,
+        audit=audit,
+        config=config,
+        now=datetime.fromisoformat("2026-10-29T12:01:00+00:00"),
+    )
+    assert reminder_actions == 1
+    assert request["estado"] == "Recordatorio enviado"
+    assert request["nivel_maximo_escalamiento"] == "PM"
+
+    escalation_actions = process_due_reminders(
+        state,
+        audit=audit,
+        config=config,
+        now=datetime.fromisoformat("2026-10-29T12:02:00+00:00"),
+        directors={"Acme": "Directora Sol"},
+    )
+    assert escalation_actions == 1
+    assert request["estado"] == "Escalada"
+    assert request["nivel_maximo_escalamiento"] == "Director"
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["datos"]["umbral"] for event in events] == [1, 2]
+    assert [event["datos"]["unidad_umbral"] for event in events] == [
+        "minutos",
+        "minutos",
+    ]
+
+
+def test_director_escalation_is_triggered_at_eight_hours(tmp_path: Path) -> None:
+    message = make_message(
+        "m1",
+        "Solicitud de personal",
+        "Cliente: Acme\nRol: Analista\nCantidad: 1",
+    )
+    audit_path = tmp_path / "audit.jsonl"
+    state = run_phase_one(
+        FakeAgentMailClient([[message]]),
+        audit_path=audit_path,
+        assignments={"Acme": "PM Ana"},
+    )
+    request = state["solicitudes"][0]
+    notified_at = datetime.fromisoformat(
+        request["fecha_notificacion"].replace("Z", "+00:00")
+    )
+
+    processed = process_due_reminders(
+        state,
+        audit=JsonlAuditLog(audit_path),
+        config=AgentConfig(testing_enabled=False),
+        now=notified_at + timedelta(hours=8),
+        directors={"Acme": "Directora Sol"},
+    )
+
+    assert processed == 2
+    assert request["estado"] == "Escalada"
+    assert request["nivel_maximo_escalamiento"] == "Director"
+    events = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    escalation = next(
+        event
+        for event in events
+        if event["decision"] == "escalamiento_director_simulado"
+    )
+    assert escalation["datos"]["director"] == "Directora Sol"
+    assert escalation["datos"]["umbral"] == 8
+
+
+def test_simulation_report_is_reproducible_without_llm(tmp_path: Path) -> None:
+    messages = [
+        make_message(
+            "m1",
+            "Solicitud de personal",
+            "Cliente: Acme\nRol: Analista\nCantidad: 1",
+        ),
+        make_message(
+            "m2",
+            "Solicitud de personal",
+            "Cliente: Beta\nRol: Ingeniero\nCantidad: 2",
+        ),
+    ]
+    config = AgentConfig(max_simulated_hours=10)
+    profiles = {
+        "PM Ana": {"perfil": "ausente", "horas_confirmacion": None},
+        "PM Luis": {"perfil": "normal", "horas_confirmacion": None},
+    }
+    assignments = {"Acme": "PM Ana", "Beta": "PM Luis"}
+    directors = {"Acme": "Directora Sol", "Beta": "Director Max"}
+    reports = []
+    for run in (1, 2):
+        reports.append(
+            run_simulation(
+                FakeAgentMailClient([messages]),
+                audit_path=tmp_path / f"audit-{run}.jsonl",
+                assignments=assignments,
+                directors=directors,
+                pm_profiles=profiles,
+                simulation_seed=42,
+                config=config,
+            )
+        )
+
+    assert reports[0] == reports[1]
+    assert reports[0]["modo"] == "sin_llm"
+    assert reports[0]["motivo_finalizacion"] == "maximo_horas_simuladas"
+    assert reports[0]["horas_simuladas"] == 10
+    no_response, simulated_response = reports[0]["solicitudes"]
+    assert no_response["hora_confirmacion"] is None
+    assert no_response["nivel_maximo_escalamiento"] == "Director"
+    assert no_response["cumplio_sla"] is False
+    expected_delay = simulated_confirmation_delay(
+        {"id": "m2", "pm_responsable": "PM Luis"},
+        profiles["PM Luis"],
+        seed=42,
+    )
+    assert simulated_response["hora_confirmacion"] == expected_delay
+    assert simulated_response["cumplio_sla"] is True
+    assert reports[0]["limites"]["llamadas_llm_realizadas"] == 0
+    audit_events = [
+        json.loads(line)
+        for line in (tmp_path / "audit-1.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert next(
+        event for event in audit_events
+        if event["decision"] == "recordatorio_enviado"
+        and event["solicitud"] == "m1"
+    )["hora_simulada"] == 4
+    assert next(
+        event for event in audit_events
+        if event["decision"] == "escalamiento_director_simulado"
+        and event["solicitud"] == "m1"
+    )["hora_simulada"] == 8
+
+    report_paths = (tmp_path / "report-1.json", tmp_path / "report-2.json")
+    for path, report in zip(report_paths, reports):
+        write_sla_report(path, report)
+    assert report_paths[0].read_bytes() == report_paths[1].read_bytes()
+
+
+def test_simulation_stops_early_when_requests_finish_and_meets_sla(
+    tmp_path: Path,
+) -> None:
+    message = make_message(
+        "m1",
+        "Solicitud de personal",
+        "Cliente: Acme\nRol: Analista\nCantidad: 1",
+    )
+    report = run_simulation(
+        FakeAgentMailClient([[message]]),
+        audit_path=tmp_path / "audit.jsonl",
+        assignments={"Acme": "PM Ana"},
+        pm_profiles={
+            "PM Ana": {"perfil": "rapido", "horas_confirmacion": 2}
+        },
+        simulation_seed=42,
+        config=AgentConfig(sla_target_hours=3, max_simulated_hours=12),
+    )
+
+    assert report["motivo_finalizacion"] == "todas_finalizadas"
+    assert report["horas_simuladas"] == 2
+    assert report["solicitudes"][0]["hora_confirmacion"] == 2
+    assert report["solicitudes"][0]["cumplio_sla"] is True
+    assert report["solicitudes"][0]["nivel_maximo_escalamiento"] == "Ninguno"
+
+
+def test_director_escalation_does_not_prevent_late_pm_confirmation(
+    tmp_path: Path,
+) -> None:
+    message = make_message(
+        "m1",
+        "Solicitud de personal",
+        "Cliente: Acme\nRol: Analista\nCantidad: 1",
+    )
+    report = run_simulation(
+        FakeAgentMailClient([[message]]),
+        audit_path=tmp_path / "audit.jsonl",
+        assignments={"Acme": "PM Ana"},
+        directors={"Acme": "Directora Sol"},
+        pm_profiles={
+            "PM Ana": {"perfil": "lento", "horas_confirmacion": 12}
+        },
+        simulation_seed=42,
+        config=AgentConfig(max_simulated_hours=15),
+    )
+
+    request = report["solicitudes"][0]
+    assert report["motivo_finalizacion"] == "todas_finalizadas"
+    assert report["horas_simuladas"] == 12
+    assert request["estado_final"] == "Confirmada"
+    assert request["hora_confirmacion"] == 12
+    assert request["nivel_maximo_escalamiento"] == "Director"
+    assert request["cumplio_sla"] is False
+
+
+def test_config_yaml_loads_thresholds_and_enforces_hard_limits(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "sla:\n"
+        "  reminder_after_hours: 3\n"
+        "  escalate_after_hours: 7\n"
+        "  target_hours: 7\n"
+        "simulation:\n"
+        "  max_hours: 20\n"
+        "  recursion_limit: 24\n"
+        "llm:\n"
+        "  max_calls: 40\n",
+        encoding="utf-8",
+    )
+
+    config = load_agent_config(config_path)
+    assert config == AgentConfig(3, 7, 7, 20, 24, 40)
+    assignments_path = tmp_path / "asignacion.csv"
+    assignments_path.write_text(
+        "cliente,PM,director\nAcme,PM Ana,Directora Sol\n",
+        encoding="utf-8",
+    )
+    assert load_director_assignments(assignments_path) == {
+        "acme": "Directora Sol"
+    }
+
+    config_path.write_text(
+        "simulation:\n  max_hours: 49\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="simulation.max_hours"):
+        load_agent_config(config_path)
+    config_path.write_text(
+        "simulation:\n  recursion_limit: 5\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="recursion_limit"):
+        load_agent_config(config_path)
+    with pytest.raises(ValueError, match="max_hours"):
+        AgentConfig(max_simulated_hours=49)
+
+
+def test_run_simulation_uses_configured_recursion_limit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    seen_limits = []
+
+    class OneTickGraph:
+        def invoke(self, state, *, config):
+            seen_limits.append(config["recursion_limit"])
+            next_state = dict(state)
+            next_state["hora_actual"] += 1
+            return next_state
+
+    monkeypatch.setattr("service.build_graph", lambda *args, **kwargs: OneTickGraph())
+    report = run_simulation(
+        FakeAgentMailClient(),
+        audit_path=tmp_path / "audit.jsonl",
+        config=AgentConfig(max_simulated_hours=12, recursion_limit=9),
+    )
+
+    assert seen_limits == [9]
+    assert report["motivo_finalizacion"] == "sin_solicitudes"
+
+
+def test_simulation_hard_caps_llm_calls_at_sixty(tmp_path: Path) -> None:
+    class CountingOpenRouter:
+        model = "test/model"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def classify_message(self, message, known_requests):
+            self.calls += 1
+            return {"categoria": "no_relacionado", "motivo": "No relacionado."}
+
+    messages = [
+        make_message(
+            f"m{index:02}",
+            "Aviso general",
+            "Reunión de equipo.",
+        )
+        for index in range(61)
+    ]
+    llm = CountingOpenRouter()
+    report = run_simulation(
+        FakeAgentMailClient([messages]),
+        audit_path=tmp_path / "audit.jsonl",
+        llm=llm,
+        config=AgentConfig(),
+    )
+
+    assert llm.calls == 60
+    assert report["limites"]["llamadas_llm_realizadas"] == 60
 
 
 def test_opened_request_and_terminal_close_transition_are_audited(

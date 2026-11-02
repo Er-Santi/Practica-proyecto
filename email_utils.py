@@ -78,6 +78,45 @@ def load_assignments(path: Path = ASSIGNMENTS_PATH) -> dict[str, str]:
     return assignments
 
 
+def load_director_assignments(path: Path = ASSIGNMENTS_PATH) -> dict[str, str]:
+    if not path.exists():
+        return {}
+
+    with path.open("r", encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        headers = {
+            normalize_text(header.strip()): header
+            for header in (reader.fieldnames or [])
+            if header
+        }
+        director_header = headers.get("director")
+        if director_header is None:
+            return {}
+        client_header = headers.get("cliente")
+        if client_header is None:
+            raise ValueError(f"{path} debe contener la columna cliente.")
+
+        directors: dict[str, str] = {}
+        for row_number, row in enumerate(reader, start=2):
+            client = str(row.get(client_header) or "").strip()
+            director = str(row.get(director_header) or "").strip()
+            if not client and not director:
+                continue
+            if not client:
+                raise ValueError(
+                    f"Fila {row_number} de {path}: cliente es obligatorio."
+                )
+            if director:
+                client_key = normalize_text(client)
+                if client_key in directors and directors[client_key] != director:
+                    raise ValueError(
+                        f"Fila {row_number} de {path}: cliente {client} tiene "
+                        "varios directores."
+                    )
+                directors[client_key] = director
+    return directors
+
+
 def load_pm_profiles(path: Path = PM_PROFILES_PATH) -> dict[str, dict[str, Any]]:
     if not path.exists():
         return {}
