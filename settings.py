@@ -54,6 +54,7 @@ PM_PROFILE_HOUR_RANGES = {
 
 
 REQUEST_MARKERS = (
+    "solicitud",
     "solicitud de personal",
     "solicitud de puesto",
     "solicitud de posicion",
@@ -61,7 +62,10 @@ REQUEST_MARKERS = (
     "solicitud de recurso",
     "solicitamos",
     "solicito",
+    "requerimiento",
     "requerimos",
+    "requirement",
+    "staffing",
     "necesitamos cubrir",
     "vacante",
     "staffing request",
@@ -71,7 +75,11 @@ REQUEST_MARKERS = (
     "we need",
     "we are looking for",
     "we're looking for",
+    "looking for",
+    "seeking",
     "se busca",
+    "busca",
+    "buscando",
     "buscamos",
     "estamos buscando",
     "necesitamos",
@@ -81,11 +89,15 @@ REQUEST_MARKERS = (
     "hiring",
     "need to hire",
     "looking to hire",
+    "recruiting",
 )
 
 HIRING_ROLE_MARKERS = (
     "engineer",
+    "devops",
+    "software engineer",
     "developer",
+    "position",
     "designer",
     "analyst",
     "architect",
@@ -95,10 +107,13 @@ HIRING_ROLE_MARKERS = (
     "data engineer",
     "mainframe",
     "full stack",
+    "fullstack",
     "frontend",
     "front end",
+    "front-end",
     "backend",
     "back end",
+    "back-end",
     "ingeniero",
     "ingeniera",
     "desarrollador",
@@ -111,6 +126,9 @@ HIRING_ROLE_MARKERS = (
     "data",
     "as400",
     "qe",
+    "scrum master",
+    "product manager",
+    "data scientist",
 )
 
 

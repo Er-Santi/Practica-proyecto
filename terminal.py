@@ -1,4 +1,5 @@
 import threading
+from queue import Empty, Full, Queue
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -22,6 +23,7 @@ from service import (
     apply_human_confirmation,
     apply_pm_update,
     assign_pm_to_request,
+    complete_request,
     close_request,
     mark_request_opened,
     run_agent_forever,
@@ -33,6 +35,16 @@ from settings import (
     configured_max_llm_calls,
 )
 from state_store import AgentStateStoreError, load_agent_state, save_agent_state
+
+COMPLETED_REQUEST_STATES = frozenset({"Cerrada"})
+
+
+def completed_requests(state: AgentState) -> list[tuple[int, dict[str, Any]]]:
+    return [
+        (index, request)
+        for index, request in enumerate(state["solicitudes"], start=1)
+        if request.get("estado") in COMPLETED_REQUEST_STATES
+    ]
 
 
 def _audit_terminal_error(
@@ -125,23 +137,112 @@ def run_terminal_agent(
     )
     stop_event = threading.Event()
     state_lock = threading.RLock()
+    approval_lock = threading.Lock()
+    pending_approvals: dict[str, tuple[dict[str, Any], Queue[dict[str, Any]]]] = {}
     state_snapshot = load_agent_state(state_path)
     announced_request_ids = {
         request["id"] for request in state_snapshot["solicitudes"]
     }
     session: PromptSession[str] = PromptSession()
 
+    def wait_for_director_approval(
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        identifier = str(payload["solicitud"])
+        attempt = int(payload.get("intento", 1))
+        should_prompt = False
+        with approval_lock:
+            existing = pending_approvals.get(identifier)
+            if existing is None:
+                response_queue: Queue[dict[str, Any]] = Queue(maxsize=1)
+                pending_approvals[identifier] = (payload, response_queue)
+                should_prompt = True
+            else:
+                previous_payload, response_queue = existing
+                should_prompt = attempt > int(previous_payload.get("intento", 1))
+                pending_approvals[identifier] = (payload, response_queue)
+        try:
+            try:
+                response = response_queue.get_nowait()
+            except Empty:
+                if not should_prompt:
+                    return None
+                print(
+                    f"\n[APROBACIÓN REQUERIDA] "
+                    f"Solicitud #{payload['numero_solicitud']} | "
+                    f"{payload['asunto']} | "
+                    f"Cliente: {payload.get('cliente') or 'No identificado'} | "
+                    f"PM: {payload.get('pm_responsable') or 'sin asignar'} | "
+                    f"Director: {payload.get('director') or 'sin asignar'}"
+                )
+                print(
+                    f"{payload['mensaje']} Escribe `approve "
+                    f"{payload['numero_solicitud']} sí` o `approve "
+                    f"{payload['numero_solicitud']} no <motivo>`."
+                )
+                try:
+                    response = response_queue.get(
+                        timeout=agent_config.sla_check_interval_seconds
+                    )
+                except Empty:
+                    if stop_event.is_set():
+                        raise RuntimeError(
+                            "El agente se detuvo antes de recibir la aprobación "
+                            "del director."
+                        )
+                    return None
+            with approval_lock:
+                current = pending_approvals.get(identifier)
+                if current is not None and current[1] is response_queue:
+                    pending_approvals.pop(identifier, None)
+            return response
+        except RuntimeError:
+            with approval_lock:
+                pending_approvals.pop(identifier, None)
+            raise
+
+    def resolve_director_approval(
+        *,
+        request_number: int,
+        approved: bool,
+        reason: str,
+    ) -> bool:
+        with approval_lock:
+            match = next(
+                (
+                    item
+                    for item in pending_approvals.values()
+                    if item[0].get("numero_solicitud") == request_number
+                ),
+                None,
+            )
+        if match is None:
+            return False
+        response_queue = match[1]
+        try:
+            response_queue.put_nowait(
+                {
+                    "approved": approved,
+                    "reason": reason,
+                }
+            )
+        except Full:
+            return False
+        return True
+
     def active_messages(state: AgentState) -> list[dict[str, Any]]:
         requests_by_id = {
             request["id"]: request
             for request in state["solicitudes"]
         }
-        completed_states = {"Confirmada", "Cerrada"}
         visible: list[dict[str, Any]] = []
         for message in state["correos_clasificados"]:
             related_id = message.get("solicitud_id") or get_message_id(message)
             request = requests_by_id.get(str(related_id))
-            if request is None or request.get("estado") not in completed_states:
+            if (
+                request is None
+                or request.get("estado") not in COMPLETED_REQUEST_STATES
+            ):
                 visible.append(message)
         return visible
 
@@ -209,6 +310,7 @@ def run_terminal_agent(
                 state_path=state_path,
                 initial_state=state_snapshot,
                 config=agent_config,
+                approval_handler=wait_for_director_approval,
             )
         except Exception as exc:
             _audit_terminal_error(audit_path, "ejecutar_agente", exc)
@@ -259,11 +361,14 @@ def run_terminal_agent(
                         "  read <n>, r <n>     Lee un correo completo\n"
                         "  reply <n>, rep <n>  Responde al correo con AgentMail\n"
                         "  new, n              Envía un correo desde el inbox AgentMail\n"
+                        "  history, historial  Consulta solicitudes cerradas o completadas\n"
                         "  status              Muestra hora, correos y solicitudes detectadas\n"
                         "  assign <n> <PM>     Asigna un PM a una solicitud de esta sesión\n"
                         "  pm <n>              Escribe en lenguaje natural la respuesta del PM\n"
-                        "  confirm <n> sí|no   Confirma o corrige inmediatamente la recepción del PM\n"
-                        "  close <n>           Cierra una solicitud atendida/cancelada\n"
+                        "  confirm <n> sí|no   Confirma si el PM se hará cargo de la solicitud\n"
+                        "  approve <n> sí|no [motivo]  Aprueba o rechaza el escalamiento al director\n"
+                        "  complete <n>        Marca como terminado el trabajo de una solicitud\n"
+                        "  close <n>           Cierra una solicitud cancelada\n"
                         "  help, h, ?          Ayuda\n"
                         "  stop, quit, q       Detiene el agente"
                     )
@@ -277,8 +382,8 @@ def run_terminal_agent(
                     print(
                         f"Hora simulada: {state['hora_actual']} | "
                         f"Correos procesados: {len(state['correos_procesados'])} | "
-                        f"Solicitudes activas: {sum(request['estado'] not in {'Confirmada', 'Cerrada'} for request in state['solicitudes'])} | "
-                        f"Finalizadas: {sum(request['estado'] in {'Confirmada', 'Cerrada'} for request in state['solicitudes'])} | "
+                        f"Solicitudes abiertas: {sum(request['estado'] != 'Cerrada' for request in state['solicitudes'])} | "
+                        f"Finalizadas: {sum(request['estado'] == 'Cerrada' for request in state['solicitudes'])} | "
                         f"Llamadas OpenRouter: {llm_usage}"
                     )
                     pm_roster = sorted(
@@ -303,7 +408,7 @@ def run_terminal_agent(
                             f"{agent_config.max_open_projects_per_pm}."
                         )
                     for index, request in enumerate(state["solicitudes"], start=1):
-                        if request["estado"] in {"Confirmada", "Cerrada"}:
+                        if request["estado"] == "Cerrada":
                             continue
                         print(
                             f"  #{index} {request['asunto']} | "
@@ -311,6 +416,28 @@ def run_terminal_agent(
                             f"Estado: {request['estado']} | "
                             f"Perfil: {request.get('perfil_pm') or 'pendiente'}"
                         )
+                elif normalized in {
+                    "history",
+                    "historial",
+                    "archivadas",
+                    "archived",
+                }:
+                    completed = completed_requests(state)
+                    if not completed:
+                        print("No hay solicitudes cerradas o completadas.")
+                        continue
+                    print("Solicitudes cerradas/completadas (conservadas en el historial):")
+                    for index, request in completed:
+                        final_date = request.get("fecha_completada") or request.get(
+                            "fecha_cierre"
+                        )
+                        print(
+                            f"  #{index} {request['asunto']} | "
+                            f"Estado: {request['estado']} | "
+                            f"PM: {request.get('pm_responsable') or 'sin asignar'}"
+                        )
+                        if final_date:
+                            print(f"    Fecha de finalización: {final_date}")
                 elif normalized.startswith(("confirm ", "confirmar ")):
                     parts = command.split()
                     if len(parts) != 3:
@@ -346,6 +473,43 @@ def run_terminal_agent(
                             audit_path,
                             "confirmacion_pm_terminal",
                             exc,
+                        )
+                elif normalized.startswith(("approve ", "aprobar ")):
+                    parts = command.split(maxsplit=3)
+                    if len(parts) < 3:
+                        print(
+                            "Uso: approve <número de solicitud> sí|no [motivo]."
+                        )
+                        continue
+                    try:
+                        request_index = int(parts[1])
+                    except ValueError:
+                        print("El número de solicitud debe ser un entero.")
+                        continue
+                    answer = normalize_text(parts[2])
+                    if answer not in {"si", "no", "yes", "y", "n"}:
+                        print("Responde `sí` o `no`.")
+                        continue
+                    approved = answer in {"si", "yes", "y"}
+                    reason = parts[3].strip() if len(parts) == 4 else ""
+                    if not approved and not reason:
+                        print("Indica el motivo del rechazo.")
+                        continue
+                    if approved and not reason:
+                        reason = "Aprobado por el usuario en la terminal."
+                    if resolve_director_approval(
+                        request_number=request_index,
+                        approved=approved,
+                        reason=reason,
+                    ):
+                        print(
+                            "Aprobación enviada al grafo."
+                            if approved
+                            else "Rechazo enviado; se reevaluará en la siguiente vuelta."
+                        )
+                    else:
+                        print(
+                            "No hay una aprobación pendiente para esa solicitud."
                         )
                 elif normalized.startswith(("assign ", "asignar ")):
                     parts = command.split(maxsplit=2)
@@ -409,6 +573,34 @@ def run_terminal_agent(
                         persist_state()
                     except (IndexError, OpenRouterError, ValueError) as exc:
                         print(f"No se pudo aplicar la respuesta del PM: {exc}")
+                elif normalized.startswith(
+                    ("complete ", "completar ", "done ", "finalizar ")
+                ):
+                    parts = command.split()
+                    if len(parts) != 2:
+                        print("Uso: complete <número de solicitud>.")
+                        continue
+                    try:
+                        request_index = int(parts[1])
+                    except ValueError:
+                        print("El número de solicitud debe ser un entero.")
+                        continue
+                    try:
+                        with state_lock:
+                            complete_request(
+                                state_snapshot,
+                                request_number=request_index,
+                                audit=JsonlAuditLog(audit_path),
+                            )
+                        persist_state()
+                    except (IndexError, ValueError) as exc:
+                        print(f"No se pudo completar la solicitud: {exc}")
+                        _audit_terminal_error(
+                            audit_path,
+                            "completar_solicitud_terminal",
+                            exc,
+                            request_number=request_index,
+                        )
                 elif normalized.startswith(("close ", "cerrar ")):
                     parts = command.split()
                     if len(parts) != 2:

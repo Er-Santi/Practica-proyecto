@@ -1,8 +1,11 @@
 import asyncio
+import builtins
 import json
 import sys
 import threading
-from datetime import datetime, timedelta
+import time
+from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -22,6 +25,7 @@ from app import (
     apply_pm_update,
     assign_pm_to_request,
     classify_by_rules,
+    complete_request,
     close_request,
     configured_max_llm_calls,
     get_message_id,
@@ -40,7 +44,11 @@ from app import (
     simulated_confirmation_delay,
     write_sla_report,
 )
-from state_store import load_agent_state
+from state_store import load_agent_state, save_agent_state
+from email_utils import infer_request_status
+from sla import build_director_approval_graph
+from terminal import completed_requests, run_terminal_agent
+from pm_assignment import count_open_projects
 
 
 def make_message(
@@ -59,6 +67,21 @@ def make_message(
         "timestamp": f"2026-10-09T10:{identifier[-1]}0:00Z",
         **extra,
     }
+
+
+def test_completed_requests_remain_available_in_history() -> None:
+    state = initial_agent_state()
+    state["solicitudes"] = [
+        {"id": "m1", "asunto": "Confirmada", "estado": "Confirmada"},
+        {"id": "m2", "asunto": "Activa", "estado": "Notificada"},
+        {"id": "m3", "asunto": "Cerrada", "estado": "Cerrada"},
+    ]
+
+    history = completed_requests(state)
+
+    assert [index for index, _ in history] == [3]
+    assert [request["id"] for _, request in history] == ["m3"]
+    assert len(state["solicitudes"]) == 3
 
 
 def test_classifies_position_request_in_spanish() -> None:
@@ -91,6 +114,77 @@ def test_rules_detect_client_requirement_without_formal_request_phrase() -> None
     )
 
     assert category == "solicitud_posicion"
+
+
+@pytest.mark.parametrize(
+    ("subject", "body"),
+    [
+        (
+            "Solicitud urgente de 4 desarrolladores Frontend",
+            "Tenemos una nueva solicitud por parte de nuestro cliente para "
+            "encontrar 4 desarrolladores frontend.",
+        ),
+        (
+            "Requerimiento de 2 ingenieros DevOps",
+            "Nuestro cliente está buscando 2 ingenieros DevOps para fortalecer "
+            "su infraestructura.",
+        ),
+    ],
+)
+def test_rules_detect_natural_language_staffing_requests(
+    subject: str,
+    body: str,
+) -> None:
+    category, _ = classify_by_rules(
+        make_message("natural-request", subject, body),
+        known_fingerprints=set(),
+        known_request_ids=set(),
+    )
+
+    assert category == "solicitud_posicion"
+
+
+def test_rules_distinguish_pm_acceptance_from_completed_work() -> None:
+    assert infer_request_status("Me hago cargo de esta solicitud.") == "confirmada"
+    assert infer_request_status("I will take ownership of this.") == "confirmada"
+    assert infer_request_status("The positions are filled.") == "cerrada"
+    assert infer_request_status("Solicitud completada.") == "cerrada"
+
+
+def test_positive_staffing_rules_override_llm_unrelated_result(
+    tmp_path: Path,
+) -> None:
+    class RejectingClassifier:
+        model = "test"
+
+        def classify_message(self, message, known_requests):
+            return {
+                "categoria": "no_relacionado",
+                "motivo": "El clasificador de prueba no detectó la solicitud.",
+            }
+
+    message = make_message(
+        "llm-conflict",
+        "Solicitud urgente de 4 desarrolladores Frontend",
+        "Tenemos una nueva solicitud para encontrar 4 desarrolladores frontend.",
+    )
+    result = run_phase_one(
+        FakeAgentMailClient([[message]]),
+        audit_path=tmp_path / "audit.jsonl",
+        assignments={"Acme": "PM Ana"},
+        llm=RejectingClassifier(),
+    )
+
+    assert [request["id"] for request in result["solicitudes"]] == [
+        "llm-conflict"
+    ]
+    classification = next(
+        event
+        for event in result["eventos"]
+        if event.get("decision") == "solicitud_posicion"
+    )
+    assert classification["datos"]["metodo_clasificacion"] == "reglas_validacion"
+    assert "OpenRouter la marcó como no relacionada" in classification["motivo"]
 
 
 def test_classifies_unrelated_email() -> None:
@@ -283,6 +377,15 @@ def test_openrouter_client_sends_model_and_parses_json(monkeypatch) -> None:
         "Bearer unit-test-key"
     )
     assert request.call_args.kwargs["json"]["model"] == "provider/test-model"
+    assert request.call_args.kwargs["headers"]["Authorization"].startswith(
+        "Bearer "
+    )
+    assert request.call_args.kwargs["headers"]["Authorization"].endswith(
+        "unit-test-key"
+    )
+    assert request.call_args.kwargs["json"]["response_format"] == {
+        "type": "json_object"
+    }
     prompt_data = json.loads(
         request.call_args.kwargs["json"]["messages"][1]["content"]
     )
@@ -562,7 +665,17 @@ def test_graph_processes_and_notifies_each_category(tmp_path: Path, capsys) -> N
         "no_relacionado",
     ]
     assert len(result["solicitudes"]) == 1
+    assert result["llamadas_llm"] == 0
     assert "NOTIFICACIÓN SIMULADA" in capsys.readouterr().out
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert all(
+        event["datos"]["metodo_clasificacion"] == "reglas"
+        for event in events
+        if event["nodo"] == "clasificar_por_reglas"
+    )
 
 
 def test_graph_uses_openrouter_for_natural_language_and_assignment(
@@ -645,7 +758,7 @@ def test_openrouter_classifies_duplicate_against_existing_requests(
                     "cantidad_posiciones": 1,
                     "pm_responsable": "PM Ana",
                     "motivo": "Primera solicitud.",
-                    "pregunta_confirmacion": "¿El PM recibió la solicitud para Acme?",
+                    "pregunta_confirmacion": "¿El PM se hará cargo de la solicitud para Acme?",
                     "preguntas_aclaracion": [],
                 }
             assert known_requests[0]["id"] == "m1"
@@ -765,12 +878,20 @@ def test_openrouter_is_enabled_by_default_and_config_errors_are_audited(
     monkeypatch,
     capsys,
 ) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("llm:\n  enabled: true\n", encoding="utf-8")
     audit_path = tmp_path / "audit.jsonl"
     monkeypatch.setattr("app.load_dotenv", lambda: None)
     monkeypatch.setattr(
         sys,
         "argv",
-        ["app.py", "--audit", str(audit_path)],
+        [
+            "app.py",
+            "--config",
+            str(config_path),
+            "--audit",
+            str(audit_path),
+        ],
     )
     monkeypatch.setenv("AGENTMAIL_API_KEY", "test-agentmail-key")
     monkeypatch.setenv("AGENTMAIL_INBOX_ID", "inbox@example.test")
@@ -782,6 +903,75 @@ def test_openrouter_is_enabled_by_default_and_config_errors_are_audited(
     event = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[0])
     assert event["decision"] == "error"
     assert event["nodo"] == "validar_configuracion"
+
+
+def test_rules_only_config_runs_without_openrouter_credentials(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("llm:\n  enabled: false\n", encoding="utf-8")
+    client = Mock(inbox_id="inbox@example.test")
+    run_terminal = Mock()
+    monkeypatch.setattr("app.load_dotenv", lambda: None)
+    monkeypatch.setattr("app.AgentMailClient", Mock(return_value=client))
+    monkeypatch.setattr("app.run_terminal_agent", run_terminal)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "app.py",
+            "--config",
+            str(config_path),
+            "--audit",
+            str(tmp_path / "audit.jsonl"),
+            "--state",
+            str(tmp_path / "state.json"),
+        ],
+    )
+    monkeypatch.setenv("AGENTMAIL_API_KEY", "test-agentmail-key")
+    monkeypatch.setenv("AGENTMAIL_INBOX_ID", "inbox@example.test")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("USE_LLM", raising=False)
+
+    assert main() == 0
+
+    run_terminal.assert_called_once()
+    assert run_terminal.call_args.kwargs["llm"] is None
+    assert "OpenRouter está desactivado" in capsys.readouterr().out
+
+
+def test_use_llm_environment_variable_overrides_config(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("llm:\n  enabled: true\n", encoding="utf-8")
+    client = Mock(inbox_id="inbox@example.test")
+    run_terminal = Mock()
+    monkeypatch.setattr("app.load_dotenv", lambda: None)
+    monkeypatch.setattr("app.AgentMailClient", Mock(return_value=client))
+    monkeypatch.setattr("app.run_terminal_agent", run_terminal)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "app.py",
+            "--config",
+            str(config_path),
+            "--audit",
+            str(tmp_path / "audit.jsonl"),
+        ],
+    )
+    monkeypatch.setenv("AGENTMAIL_API_KEY", "test-agentmail-key")
+    monkeypatch.setenv("AGENTMAIL_INBOX_ID", "inbox@example.test")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("USE_LLM", "false")
+
+    assert main() == 0
+
+    assert run_terminal.call_args.kwargs["llm"] is None
 
 
 def test_cli_simulation_writes_final_sla_report(
@@ -1179,6 +1369,16 @@ def test_user_can_confirm_or_reject_without_a_new_email(tmp_path: Path) -> None:
     assert request["estado"] == "Confirmada"
     assert request["hora_confirmacion"] == state["hora_actual"]
     assert request["confirmacion_usuario"] is True
+    assert completed_requests(state) == []
+    assert count_open_projects(state["solicitudes"], "PM Ana") == 1
+
+    complete_request(
+        state,
+        request_number=1,
+        audit=JsonlAuditLog(audit_path),
+    )
+    assert request["estado"] == "Cerrada"
+    assert completed_requests(state)[0][1]["id"] == "m1"
     events = [
         json.loads(line)
         for line in audit_path.read_text(encoding="utf-8").splitlines()
@@ -1188,6 +1388,7 @@ def test_user_can_confirm_or_reject_without_a_new_email(tmp_path: Path) -> None:
         event["decision"] == "pm_no_confirmado_por_usuario"
         for event in events
     )
+    assert any(event["decision"] == "solicitud_completada" for event in events)
 
 
 def test_graph_processes_one_inbox_poll_per_invocation(tmp_path: Path) -> None:
@@ -1341,7 +1542,58 @@ def test_service_backfills_old_messages_and_restores_active_state(
     assert restored["solicitudes"][0]["id"] == "old-1"
 
 
-def test_due_reminder_is_sent_once_after_configured_four_hours(tmp_path: Path) -> None:
+def test_service_reclassifies_saved_staffing_emails_previously_marked_unrelated(
+    tmp_path: Path,
+) -> None:
+    missed_message = make_message(
+        "missed-1",
+        "Solicitud urgente de 4 desarrolladores Frontend",
+        "Tenemos una nueva solicitud por parte de nuestro cliente para "
+        "encontrar 4 desarrolladores frontend. Cliente: Acme",
+    )
+    initial_state = initial_agent_state()
+    initial_state["correos_clasificados"] = [
+        {**missed_message, "categoria": "no_relacionado"}
+    ]
+    initial_state["correos_procesados"] = ["missed-1"]
+    stop_event = threading.Event()
+    client = FakeAgentMailClient([], stop_event=stop_event)
+
+    def stop_after_reclassification(state) -> None:
+        if any(request["id"] == "missed-1" for request in state["solicitudes"]):
+            stop_event.set()
+
+    result = run_agent_forever(
+        client,
+        audit_path=tmp_path / "audit.jsonl",
+        stop_event=stop_event,
+        on_state=stop_after_reclassification,
+        reconnect_interval=0.01,
+        assignments={"Acme": "PM Ana"},
+        initial_state=initial_state,
+        state_path=tmp_path / "state.json",
+    )
+
+    assert [request["id"] for request in result["solicitudes"]] == ["missed-1"]
+    assert next(
+        item
+        for item in result["correos_clasificados"]
+        if item["message_id"] == "missed-1"
+    )["categoria"] == "solicitud_posicion"
+    audit_events = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(
+        event["decision"] == "correo_no_relacionado_reevaluado"
+        for event in audit_events
+    )
+
+
+def test_due_reminder_is_sent_once_after_configured_four_hours(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     message = make_message(
         "m1",
         "Solicitud de personal",
@@ -1368,12 +1620,18 @@ def test_due_reminder_is_sent_once_after_configured_four_hours(tmp_path: Path) -
 
     assert sent == 1
     assert request["estado"] == "Recordatorio enviado"
+    assert request["numero_notificacion_seguimiento"] == 1
+    reminder_output = capsys.readouterr().out
+    assert "[NOTIFICACIÓN DE SEGUIMIENTO SIMULADA #1]" in reminder_output
+    assert "Para: PM Ana" in reminder_output
+    assert "PM asignado: PM Ana" in reminder_output
     assert process_due_reminders(
         state,
         audit=JsonlAuditLog(audit_path),
         config=AgentConfig(testing_enabled=False),
         now=reminder_time + timedelta(hours=1),
     ) == 0
+    assert request["numero_notificacion_seguimiento"] == 1
     events = [
         json.loads(line)
         for line in audit_path.read_text(encoding="utf-8").splitlines()
@@ -1382,9 +1640,12 @@ def test_due_reminder_is_sent_once_after_configured_four_hours(tmp_path: Path) -
     assert reminder["datos"]["reloj_simulado"] is False
     assert reminder["datos"]["notificacion_simulada"] is True
     assert reminder["datos"]["umbral"] == 4
+    assert reminder["datos"]["numero_notificacion"] == 1
+    assert reminder["datos"]["destinatario"] == "PM Ana"
+    assert reminder["datos"]["pm_responsable"] == "PM Ana"
 
 
-def test_testing_sla_uses_one_and_two_minute_thresholds(tmp_path: Path) -> None:
+def test_testing_sla_uses_configured_minute_milestones(tmp_path: Path) -> None:
     request = {
         "id": "m-test",
         "asunto": "Solicitud de prueba",
@@ -1411,28 +1672,71 @@ def test_testing_sla_uses_one_and_two_minute_thresholds(tmp_path: Path) -> None:
     assert request["estado"] == "Recordatorio enviado"
     assert request["nivel_maximo_escalamiento"] == "PM"
 
-    escalation_actions = process_due_reminders(
+    second_reminder_actions = process_due_reminders(
         state,
         audit=audit,
         config=config,
         now=datetime.fromisoformat("2026-10-29T12:02:00+00:00"),
         directors={"Acme": "Directora Sol"},
     )
+    assert second_reminder_actions == 1
+    assert request["estado"] == "Recordatorio enviado"
+
+    escalation_actions = process_due_reminders(
+        state,
+        audit=audit,
+        config=config,
+        now=datetime.fromisoformat("2026-10-29T12:04:00+00:00"),
+        directors={"Acme": "Directora Sol"},
+        approval_handler=lambda _: {
+            "approved": True,
+            "reason": "Aprobado para la prueba.",
+        },
+    )
     assert escalation_actions == 1
     assert request["estado"] == "Escalada"
     assert request["nivel_maximo_escalamiento"] == "Director"
+    assert request["numero_notificacion_seguimiento"] == 3
     events = [
         json.loads(line)
         for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert [event["datos"]["umbral"] for event in events] == [1, 2]
+    milestone_events = [
+        event
+        for event in events
+        if event["decision"]
+        in {
+            "recordatorio_enviado",
+            "segundo_recordatorio_enviado",
+            "escalamiento_director_aprobado",
+        }
+    ]
+    assert [event["datos"]["umbral"] for event in milestone_events] == [1, 2, 4]
+    assert [event["datos"]["numero_notificacion"] for event in milestone_events] == [
+        1,
+        2,
+        3,
+    ]
+    assert [event["datos"]["destinatario"] for event in milestone_events] == [
+        "PM Ana",
+        "PM Ana",
+        "Directora Sol",
+    ]
+    assert all(
+        event["datos"]["pm_responsable"] == "PM Ana"
+        for event in milestone_events
+    )
     assert [event["datos"]["unidad_umbral"] for event in events] == [
+        "minutos",
+        "minutos",
         "minutos",
         "minutos",
     ]
 
 
-def test_director_escalation_is_triggered_at_eight_hours(tmp_path: Path) -> None:
+def test_director_escalation_requires_approval_at_sixteen_hours(
+    tmp_path: Path,
+) -> None:
     message = make_message(
         "m1",
         "Solicitud de personal",
@@ -1449,7 +1753,7 @@ def test_director_escalation_is_triggered_at_eight_hours(tmp_path: Path) -> None
         request["fecha_notificacion"].replace("Z", "+00:00")
     )
 
-    processed = process_due_reminders(
+    processed_at_eight_hours = process_due_reminders(
         state,
         audit=JsonlAuditLog(audit_path),
         config=AgentConfig(testing_enabled=False),
@@ -1457,7 +1761,23 @@ def test_director_escalation_is_triggered_at_eight_hours(tmp_path: Path) -> None
         directors={"Acme": "Directora Sol"},
     )
 
-    assert processed == 2
+    assert processed_at_eight_hours == 2
+    assert request["estado"] == "Recordatorio enviado"
+    assert request["escalado_director"] is False
+
+    processed_at_sixteen_hours = process_due_reminders(
+        state,
+        audit=JsonlAuditLog(audit_path),
+        config=AgentConfig(testing_enabled=False),
+        now=notified_at + timedelta(hours=16),
+        directors={"Acme": "Directora Sol"},
+        approval_handler=lambda _: {
+            "approved": True,
+            "reason": "Autorizado por la prueba.",
+        },
+    )
+
+    assert processed_at_sixteen_hours == 1
     assert request["estado"] == "Escalada"
     assert request["nivel_maximo_escalamiento"] == "Director"
     events = [
@@ -1467,10 +1787,251 @@ def test_director_escalation_is_triggered_at_eight_hours(tmp_path: Path) -> None
     escalation = next(
         event
         for event in events
-        if event["decision"] == "escalamiento_director_simulado"
+        if event["decision"] == "escalamiento_director_aprobado"
     )
     assert escalation["datos"]["director"] == "Directora Sol"
-    assert escalation["datos"]["umbral"] == 8
+    assert escalation["datos"]["umbral"] == 16
+
+
+def test_rejected_director_escalation_is_audited_and_retried(
+    tmp_path: Path,
+) -> None:
+    request = {
+        "id": "m-approval",
+        "asunto": "Solicitud de prueba",
+        "cliente": "Acme",
+        "pm_responsable": "PM Ana",
+        "estado": "Notificada",
+        "fecha_notificacion": "2026-10-29T12:00:00+00:00",
+        "hora_notificacion": 0,
+    }
+    state = initial_agent_state()
+    state["solicitudes"] = [request]
+    audit_path = tmp_path / "audit.jsonl"
+    audit = JsonlAuditLog(audit_path)
+    graph = build_director_approval_graph()
+    responses = [
+        {"approved": False, "reason": "Falta validar presupuesto."},
+        {"approved": True, "reason": "Presupuesto validado."},
+    ]
+    approval_payloads: list[dict[str, Any]] = []
+
+    def approval_handler(payload: dict[str, Any]) -> dict[str, Any]:
+        approval_payloads.append(payload)
+        return responses.pop(0)
+
+    first_review = datetime.fromisoformat(
+        "2026-10-30T04:00:00+00:00"
+    )
+    process_due_reminders(
+        state,
+        audit=audit,
+        config=AgentConfig(testing_enabled=False),
+        now=first_review,
+        directors={"Acme": "Directora Sol"},
+        approval_handler=approval_handler,
+        approval_graph=graph,
+    )
+    assert request["estado"] == "Recordatorio enviado"
+    assert request.get("escalado_director", False) is False
+
+    process_due_reminders(
+        state,
+        audit=audit,
+        config=AgentConfig(testing_enabled=False),
+        now=first_review + timedelta(minutes=5),
+        directors={"Acme": "Directora Sol"},
+        approval_handler=approval_handler,
+        approval_graph=graph,
+    )
+    assert request["estado"] == "Escalada"
+    assert request["escalado_director"] is True
+    assert request["intentos_aprobacion_director"] == 2
+    assert [payload["intento"] for payload in approval_payloads] == [1, 2]
+
+    events = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    rejection = next(
+        event
+        for event in events
+        if event["decision"] == "escalamiento_director_rechazado"
+    )
+    assert rejection["motivo"] == "Falta validar presupuesto."
+    assert sum(
+        event["decision"] == "aprobacion_director_solicitada"
+        for event in events
+    ) == 2
+
+
+def test_unanswered_director_approval_is_repeated_with_next_sla_notification(
+    tmp_path: Path,
+) -> None:
+    request = {
+        "id": "m-unanswered-approval",
+        "asunto": "Solicitud de prueba",
+        "cliente": "Acme",
+        "pm_responsable": "PM Ana",
+        "estado": "Notificada",
+        "fecha_notificacion": "2026-10-29T12:00:00+00:00",
+        "hora_notificacion": 0,
+    }
+    state = initial_agent_state()
+    state["solicitudes"] = [request]
+    audit_path = tmp_path / "audit.jsonl"
+    audit = JsonlAuditLog(audit_path)
+    graph = build_director_approval_graph()
+    approval_attempts: list[int] = []
+
+    def approval_handler(payload: dict[str, Any]) -> dict[str, Any] | None:
+        attempt = int(payload["intento"])
+        approval_attempts.append(attempt)
+        if attempt == 1:
+            return None
+        return {"approved": True, "reason": "Aprobado en el segundo aviso."}
+
+    first_review = datetime.fromisoformat("2026-10-30T04:00:00+00:00")
+    config = AgentConfig(testing_enabled=False)
+    process_due_reminders(
+        state,
+        audit=audit,
+        config=config,
+        now=first_review,
+        directors={"Acme": "Directora Sol"},
+        approval_handler=approval_handler,
+        approval_graph=graph,
+    )
+    assert request["aprobacion_director_pendiente"] is True
+    assert request.get("escalado_director", False) is False
+
+    actions_before_repeat = len(state["eventos"])
+    process_due_reminders(
+        state,
+        audit=audit,
+        config=config,
+        now=first_review + timedelta(hours=2) - timedelta(minutes=1),
+        directors={"Acme": "Directora Sol"},
+        approval_handler=approval_handler,
+        approval_graph=graph,
+    )
+    assert request["aprobacion_director_pendiente"] is True
+    assert len(state["eventos"]) == actions_before_repeat
+
+    process_due_reminders(
+        state,
+        audit=audit,
+        config=config,
+        now=first_review + timedelta(hours=2),
+        directors={"Acme": "Directora Sol"},
+        approval_handler=approval_handler,
+        approval_graph=graph,
+    )
+
+    assert request["estado"] == "Escalada"
+    assert request["escalado_director"] is True
+    assert request["aprobacion_director_pendiente"] is False
+    assert approval_attempts == [1, 1, 1, 2]
+    events = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert sum(
+        event["decision"] == "aprobacion_director_solicitada"
+        for event in events
+    ) == 2
+    assert sum(
+        event["decision"] == "aprobacion_director_sin_respuesta"
+        for event in events
+    ) == 1
+    repeated_notice = next(
+        event
+        for event in events
+        if event["decision"] == "repetir_solicitud_aprobacion_director"
+    )
+    assert repeated_notice["datos"]["destinatario"] == "Directora Sol"
+    assert repeated_notice["datos"]["numero_notificacion"] >= 1
+
+
+def test_terminal_can_answer_director_approval_without_blocking_state_lock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    approval_prompted = threading.Event()
+    request = {
+        "id": "m-terminal-approval",
+        "asunto": "Solicitud de prueba",
+        "cliente": "Acme",
+        "pm_responsable": "PM Ana",
+        "estado": "Notificada",
+        "fecha_notificacion": (
+            datetime.now(timezone.utc) - timedelta(hours=17)
+        ).isoformat(),
+        "hora_notificacion": 0,
+    }
+    initial_state = initial_agent_state()
+    initial_state["solicitudes"] = [request]
+    state_path = tmp_path / "state.json"
+    save_agent_state(state_path, initial_state)
+
+    class FakePromptSession:
+        def prompt(self, prompt_text: str) -> str:
+            if prompt_text != "agentmail> ":
+                return ""
+            if not approval_prompted.wait(timeout=3):
+                return "stop"
+            if not hasattr(self, "approval_sent"):
+                self.approval_sent = True
+                return "approve 1 sí"
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if (
+                    load_agent_state(state_path)["solicitudes"][0]["estado"]
+                    == "Escalada"
+                ):
+                    return "stop"
+                time.sleep(0.01)
+            return "stop"
+
+    import terminal as terminal_module
+
+    original_print = builtins.print
+
+    def observe_approval_prompt(*args: Any, **kwargs: Any) -> None:
+        if any("[APROBACIÓN REQUERIDA]" in str(arg) for arg in args):
+            approval_prompted.set()
+        original_print(*args, **kwargs)
+
+    monkeypatch.setattr(terminal_module, "PromptSession", FakePromptSession)
+    monkeypatch.setattr(
+        terminal_module,
+        "patch_stdout",
+        lambda: nullcontext(),
+    )
+    monkeypatch.setattr(
+        terminal_module,
+        "print",
+        observe_approval_prompt,
+        raising=False,
+    )
+
+    run_terminal_agent(
+        FakeAgentMailClient([]),
+        audit_path=tmp_path / "audit.jsonl",
+        reconnect_interval=0.01,
+        assignments={"Acme": "PM Ana"},
+        directors={"Acme": "Directora Sol"},
+        state_path=state_path,
+        config=AgentConfig(testing_enabled=False),
+    )
+
+    saved_state = load_agent_state(state_path)
+    assert saved_state["solicitudes"][0]["estado"] == "Escalada"
+    assert saved_state["solicitudes"][0]["escalado_director"] is True
+    assert any(
+        json.loads(line)["decision"] == "escalamiento_director_aprobado"
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    )
 
 
 def test_simulation_report_is_reproducible_without_llm(tmp_path: Path) -> None:
@@ -1486,7 +2047,7 @@ def test_simulation_report_is_reproducible_without_llm(tmp_path: Path) -> None:
             "Cliente: Beta\nRol: Ingeniero\nCantidad: 2",
         ),
     ]
-    config = AgentConfig(max_simulated_hours=10)
+    config = AgentConfig(max_simulated_hours=37)
     profiles = {
         "PM Ana": {"perfil": "ausente", "horas_confirmacion": None},
         "PM Luis": {"perfil": "normal", "horas_confirmacion": None},
@@ -1510,10 +2071,10 @@ def test_simulation_report_is_reproducible_without_llm(tmp_path: Path) -> None:
     assert reports[0] == reports[1]
     assert reports[0]["modo"] == "sin_llm"
     assert reports[0]["motivo_finalizacion"] == "maximo_horas_simuladas"
-    assert reports[0]["horas_simuladas"] == 10
+    assert reports[0]["horas_simuladas"] == 37
     no_response, simulated_response = reports[0]["solicitudes"]
     assert no_response["hora_confirmacion"] is None
-    assert no_response["nivel_maximo_escalamiento"] == "Director"
+    assert no_response["nivel_maximo_escalamiento"] == "Comercial/Delivery"
     assert no_response["cumplio_sla"] is False
     expected_delay = simulated_confirmation_delay(
         {"id": "m2", "pm_responsable": "PM Luis"},
@@ -1538,7 +2099,52 @@ def test_simulation_report_is_reproducible_without_llm(tmp_path: Path) -> None:
         event for event in audit_events
         if event["decision"] == "escalamiento_director_simulado"
         and event["solicitud"] == "m1"
+    )["hora_simulada"] == 16
+    assert next(
+        event for event in audit_events
+        if event["decision"] == "segundo_recordatorio_enviado"
+        and event["solicitud"] == "m1"
     )["hora_simulada"] == 8
+    assert next(
+        event for event in audit_events
+        if event["decision"] == "recordatorio_siguiente_nivel_enviado"
+        and event["solicitud"] == "m1"
+    )["hora_simulada"] == 24
+    assert next(
+        event for event in audit_events
+        if event["decision"] == "involucrar_comercial_y_delivery"
+        and event["solicitud"] == "m1"
+    )["hora_simulada"] == 32
+    assert [
+        event["hora_simulada"]
+        for event in audit_events
+        if event["decision"] == "repetir_recordatorio_escalamiento"
+        and event["solicitud"] == "m1"
+    ] == [34, 36]
+    followup_events = [
+        event
+        for event in audit_events
+        if event["solicitud"] == "m1"
+        and "numero_notificacion" in event["datos"]
+    ]
+    assert [
+        event["datos"]["numero_notificacion"] for event in followup_events
+    ] == list(range(1, 8))
+    assert [
+        event["datos"]["destinatario"] for event in followup_events
+    ] == [
+        "PM Ana",
+        "PM Ana",
+        "Directora Sol",
+        "Directora Sol",
+        "Equipo Comercial; Responsable de Delivery",
+        "Director; Equipo Comercial; Responsable de Delivery",
+        "Director; Equipo Comercial; Responsable de Delivery",
+    ]
+    assert all(
+        event["datos"]["pm_responsable"] == "PM Ana"
+        for event in followup_events
+    )
 
     report_paths = (tmp_path / "report-1.json", tmp_path / "report-2.json")
     for path, report in zip(report_paths, reports):
@@ -1565,10 +2171,12 @@ def test_simulation_stops_early_when_requests_finish_and_meets_sla(
         config=AgentConfig(sla_target_hours=3, max_simulated_hours=12),
     )
 
-    assert report["motivo_finalizacion"] == "todas_finalizadas"
+    assert report["motivo_finalizacion"] == "todas_confirmadas_o_cerradas"
     assert report["horas_simuladas"] == 2
     assert report["solicitudes"][0]["hora_confirmacion"] == 2
     assert report["solicitudes"][0]["cumplio_sla"] is True
+    assert report["solicitudes"][0]["pm_confirmo"] is True
+    assert report["solicitudes"][0]["trabajo_finalizado"] is False
     assert report["solicitudes"][0]["nivel_maximo_escalamiento"] == "Ninguno"
 
 
@@ -1586,17 +2194,17 @@ def test_director_escalation_does_not_prevent_late_pm_confirmation(
         assignments={"Acme": "PM Ana"},
         directors={"Acme": "Directora Sol"},
         pm_profiles={
-            "PM Ana": {"perfil": "lento", "horas_confirmacion": 12}
+            "PM Ana": {"perfil": "lento", "horas_confirmacion": 18}
         },
         simulation_seed=42,
-        config=AgentConfig(max_simulated_hours=15),
+        config=AgentConfig(max_simulated_hours=20),
     )
 
     request = report["solicitudes"][0]
-    assert report["motivo_finalizacion"] == "todas_finalizadas"
-    assert report["horas_simuladas"] == 12
+    assert report["motivo_finalizacion"] == "todas_confirmadas_o_cerradas"
+    assert report["horas_simuladas"] == 18
     assert request["estado_final"] == "Confirmada"
-    assert request["hora_confirmacion"] == 12
+    assert request["hora_confirmacion"] == 18
     assert request["nivel_maximo_escalamiento"] == "Director"
     assert request["cumplio_sla"] is False
 
@@ -1608,7 +2216,10 @@ def test_config_yaml_loads_thresholds_and_enforces_hard_limits(
     config_path.write_text(
         "sla:\n"
         "  reminder_after_hours: 3\n"
+        "  second_reminder_after_hours: 5\n"
         "  escalate_after_hours: 7\n"
+        "  next_level_reminder_after_hours: 9\n"
+        "  commercial_delivery_after_hours: 11\n"
         "  target_hours: 7\n"
         "simulation:\n"
         "  max_hours: 20\n"
@@ -1619,7 +2230,17 @@ def test_config_yaml_loads_thresholds_and_enforces_hard_limits(
     )
 
     config = load_agent_config(config_path)
-    assert config == AgentConfig(3, 7, 7, 20, 24, 40)
+    assert config == AgentConfig(
+        reminder_after_hours=3,
+        second_reminder_after_hours=5,
+        escalate_after_hours=7,
+        next_level_reminder_after_hours=9,
+        commercial_delivery_after_hours=11,
+        sla_target_hours=7,
+        max_simulated_hours=20,
+        recursion_limit=24,
+        max_llm_calls=40,
+    )
     assignments_path = tmp_path / "asignacion.csv"
     assignments_path.write_text(
         "cliente,PM,director\nAcme,PM Ana,Directora Sol\n",
@@ -1740,6 +2361,47 @@ def test_opened_request_and_terminal_close_transition_are_audited(
     ]
     assert any(event["decision"] == "solicitud_abierta" for event in events)
     assert any(event["decision"] == "solicitud_cerrada" for event in events)
+
+
+def test_pm_acceptance_and_completion_have_distinct_statuses(
+    tmp_path: Path,
+) -> None:
+    message = make_message(
+        "pm-acceptance",
+        "Solicitud de personal",
+        "Cliente: Acme\nRol: Analista\nCantidad: 1",
+    )
+    audit_path = tmp_path / "audit.jsonl"
+    state = run_phase_one(
+        FakeAgentMailClient([[message]]),
+        audit_path=audit_path,
+        assignments={"Acme": "PM Ana"},
+    )
+
+    apply_pm_update(
+        state,
+        request_number=1,
+        response_text="I will take ownership of this request.",
+        audit=JsonlAuditLog(audit_path),
+        llm=None,
+        assignments={"Acme": "PM Ana"},
+    )
+    request = state["solicitudes"][0]
+    assert request["estado"] == "Confirmada"
+    assert request["hora_confirmacion"] == state["hora_actual"]
+    assert completed_requests(state) == []
+    assert count_open_projects(state["solicitudes"], "PM Ana") == 1
+
+    apply_pm_update(
+        state,
+        request_number=1,
+        response_text="The positions are filled.",
+        audit=JsonlAuditLog(audit_path),
+        llm=None,
+        assignments={"Acme": "PM Ana"},
+    )
+    assert request["estado"] == "Cerrada"
+    assert completed_requests(state)[0][1]["id"] == "pm-acceptance"
 
 
 def test_pm_status_update_escalates_or_confirms_request(tmp_path: Path) -> None:

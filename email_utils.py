@@ -298,7 +298,10 @@ def confirmation_question(request: Mapping[str, Any]) -> str:
         request.get("asunto") or "esta solicitud de trabajo"
     )
     pm = request.get("pm_responsable") or "el PM asignado"
-    return f"¿Confirmas que {pm} recibió la solicitud de {work_description}?"
+    return (
+        f"¿Confirmas que {pm} se hará cargo de la solicitud de "
+        f"{work_description}?"
+    )
 
 
 def clarification_questions(request: Mapping[str, Any]) -> list[str]:
@@ -366,6 +369,45 @@ def infer_request_status(text: str) -> str | None:
             "ya se cubrió",
         )
     ):
+        return "cerrada"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "i will take ownership",
+            "i'll take ownership",
+            "i will handle this",
+            "i'll handle this",
+            "i will handle it",
+            "i'll handle it",
+            "i will take care of this",
+            "i'll take care of this",
+            "i will take this",
+            "i'll take this",
+            "i can take this",
+            "i can handle this",
+            "i am taking ownership",
+            "i'm taking ownership",
+            "happy to take this",
+            "me hare cargo",
+            "me haré cargo",
+            "yo me hago cargo",
+            "me hago cargo",
+            "yo me encargo",
+            "me encargare",
+            "me encargaré",
+            "me encargo",
+            "me responsabilizo",
+            "me hago responsable",
+            "cuenta conmigo",
+            "lo tomo",
+            "la tomo",
+            "lo tomo yo",
+            "la tomo yo",
+            "confirmo que me hago cargo",
+            "confirmo que me hare cargo",
+            "confirmo que me haré cargo",
+        )
+    ):
         return "confirmada"
     return None
 
@@ -421,24 +463,37 @@ def classify_by_rules(
     )
     has_explicit_intent = any(
         marker in normalized_body for marker in REQUEST_MARKERS
-    ) or "requirement" in normalized_body
+    ) or bool(
+        re.search(
+            r"\b(?:need|needs|needed|seeking|seeks|recruit|recruits|"
+            r"recruiting|hiring|hire|hires|buscar|busca|buscan|buscando|"
+            r"necesita|necesitan|requerir|requiere|requieren|contratar|"
+            r"contratando)\b",
+            normalized_body,
+        )
+    )
     has_positions_table = (
         "total positions" in normalized_body
         or "total de posiciones" in normalized_body
         or ("role" in normalized_body and "positions" in normalized_body)
     )
-    is_position_request = (
-        any(marker in normalized_body for marker in REQUEST_MARKERS)
-        or (
-            has_role
-            and has_quantity
-            and (has_explicit_intent or has_positions_table)
+    has_explicit_staffing_request = any(
+        phrase in normalized_body
+        for phrase in (
+            "solicitud de personal",
+            "solicitud de puesto",
+            "solicitud de posicion",
+            "solicitud de recurso",
+            "position request",
+            "resource request",
+            "staffing request",
+            "headcount request",
+            "request for personnel",
         )
-        or (
-            has_role
-            and has_positions_table
-            and has_quantity
-        )
+    )
+    is_position_request = has_explicit_staffing_request or (
+        has_role
+        and (has_explicit_intent or (has_quantity and has_positions_table))
     )
     if not is_position_request:
         return "no_relacionado", (
@@ -450,9 +505,7 @@ def classify_by_rules(
         return "duplicado", "El contenido coincide con una solicitud ya clasificada."
     if identifier and identifier in known_request_ids:
         return "duplicado", "El identificador ya pertenece a una solicitud registrada."
-    if has_role and has_quantity and not any(
-        marker in normalized_body for marker in REQUEST_MARKERS
-    ):
+    if has_role and has_quantity and not has_explicit_intent:
         reason = "El correo enumera roles de trabajo y cantidades, aunque no use una frase formal de solicitud."
     else:
         reason = "El correo expresa una necesidad de incorporar o buscar personal."

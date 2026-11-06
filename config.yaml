@@ -1,6 +1,11 @@
 sla:
   reminder_after_hours: 4
-  escalate_after_hours: 8
+  second_reminder_after_hours: 8
+  escalate_after_hours: 16
+  next_level_reminder_after_hours: 24
+  commercial_delivery_after_hours: 32
+  # También repite la pregunta de aprobación humana si sigue pendiente.
+  repeat_after_hours: 2
   target_hours: 8
 
 simulation:
@@ -8,6 +13,8 @@ simulation:
   recursion_limit: 16
 
 llm:
+  # false: clasifica por reglas y usa mensajes de plantilla, sin OpenRouter.
+  enabled: false
   max_calls: 60
 
 assignment:
@@ -16,6 +23,11 @@ assignment:
 testing:
   enabled: true
   reminder_after_minutes: 1
-  escalate_after_minutes: 2
+  second_reminder_after_minutes: 2
+  escalate_after_minutes: 4
+  next_level_reminder_after_minutes: 6
+  commercial_delivery_after_minutes: 8
+  # También repite la pregunta de aprobación humana si sigue pendiente.
+  repeat_after_minutes: 2
   sla_target_minutes: 3
   check_interval_seconds: 5

@@ -7,7 +7,7 @@ from typing import Any
 
 from agent_config import AgentConfig
 from agent_state import AgentState
-from sla import FINAL_STATES
+from sla import SLA_STOP_STATES
 
 
 def build_sla_report(
@@ -24,7 +24,7 @@ def build_sla_report(
         if not isinstance(confirmation_hour, int):
             confirmation_hour = None
         complied = (
-            request.get("estado") == "Confirmada"
+            request.get("estado") in SLA_STOP_STATES
             and confirmation_hour is not None
             and confirmation_hour <= config.sla_target_hours
         )
@@ -33,6 +33,11 @@ def build_sla_report(
                 "id": request["id"],
                 "asunto": request["asunto"],
                 "estado_final": request["estado"],
+                "pm_confirmo": (
+                    request.get("estado") in SLA_STOP_STATES
+                    and confirmation_hour is not None
+                ),
+                "trabajo_finalizado": bool(request.get("fecha_completada")),
                 "hora_confirmacion": confirmation_hour,
                 "nivel_maximo_escalamiento": request.get(
                     "nivel_maximo_escalamiento",
@@ -42,11 +47,13 @@ def build_sla_report(
             }
         )
 
-    terminal = all(item["estado_final"] in FINAL_STATES for item in requests)
+    terminal = all(
+        item["estado_final"] in SLA_STOP_STATES for item in requests
+    )
     if not requests:
         stop_reason = "sin_solicitudes"
     elif terminal:
-        stop_reason = "todas_finalizadas"
+        stop_reason = "todas_confirmadas_o_cerradas"
     else:
         stop_reason = "maximo_horas_simuladas"
 
@@ -67,8 +74,16 @@ def build_sla_report(
             "llamadas_llm_realizadas": state["llamadas_llm"],
         },
         "umbrales_sla": {
-            "recordatorio_pm_horas": config.reminder_after_hours,
+            "primer_recordatorio_pm_horas": config.reminder_after_hours,
+            "segundo_recordatorio_pm_horas": config.second_reminder_after_hours,
             "escalamiento_director_horas": config.escalate_after_hours,
+            "recordatorio_siguiente_nivel_horas": (
+                config.next_level_reminder_after_hours
+            ),
+            "involucrar_comercial_delivery_horas": (
+                config.commercial_delivery_after_hours
+            ),
+            "repetir_cada_horas": config.repeat_after_hours,
             "objetivo_sla_horas": config.sla_target_hours,
         },
         "resumen_sla": {

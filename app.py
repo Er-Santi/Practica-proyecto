@@ -40,6 +40,7 @@ from service import (
     apply_human_confirmation,
     apply_pm_update,
     assign_pm_to_request,
+    complete_request,
     close_request,
     mark_request_opened,
     process_due_reminders,
@@ -100,6 +101,7 @@ __all__ = [
     "build_graph",
     "clarification_questions",
     "classify_by_rules",
+    "complete_request",
     "close_request",
     "confirmation_question",
     "configured_max_llm_calls",
@@ -207,18 +209,29 @@ def main() -> int:
     api_key = os.environ.get("AGENTMAIL_API_KEY", "").strip()
     inbox_id = os.environ.get("AGENTMAIL_INBOX_ID", "").strip()
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    use_llm_setting = os.environ.get("USE_LLM", "true").strip().casefold()
-    if use_llm_setting not in {"true", "false", "1", "0", "yes", "no"}:
-        error = ValueError("USE_LLM debe ser true o false.")
-        audit_error(audit, error, node="validar_configuracion")
-        parser.error(str(error))
-    use_llm = use_llm_setting in {"true", "1", "yes"}
     if args.reconnect_seconds <= 0:
         error = ValueError("--reconnect-seconds debe ser mayor que cero.")
         audit_error(audit, error, node="validar_configuracion")
         parser.error(str(error))
 
     try:
+        agent_config = load_agent_config(args.config)
+        use_llm_setting = os.environ.get("USE_LLM")
+        if use_llm_setting is None:
+            use_llm = agent_config.llm_enabled
+        else:
+            normalized_llm_setting = use_llm_setting.strip().casefold()
+            if normalized_llm_setting not in {
+                "true",
+                "false",
+                "1",
+                "0",
+                "yes",
+                "no",
+            }:
+                raise ValueError("USE_LLM debe ser true o false.")
+            use_llm = normalized_llm_setting in {"true", "1", "yes"}
+
         if not api_key or not inbox_id:
             raise ValueError(
                 "Configura AGENTMAIL_API_KEY y AGENTMAIL_INBOX_ID en .env."
@@ -227,7 +240,6 @@ def main() -> int:
             raise ValueError(
                 "OpenRouter está activado; configura OPENROUTER_API_KEY en .env."
             )
-        agent_config = load_agent_config(args.config)
         agent_config = replace(
             agent_config,
             max_llm_calls=configured_max_llm_calls(agent_config.max_llm_calls),
@@ -264,17 +276,31 @@ def main() -> int:
         print("OpenRouter está desactivado; se utilizarán las reglas de respaldo.")
     if agent_config.testing_enabled:
         print(
-            "Modo de prueba SLA activo: recordatorio a los "
-            f"{agent_config.test_reminder_after_minutes} min, escalamiento a los "
-            f"{agent_config.test_escalate_after_minutes} min, objetivo SLA "
-            f"{agent_config.test_sla_target_minutes} min; comprobación cada "
+            "Modo de prueba SLA activo: avisos al PM a los "
+            f"{agent_config.test_reminder_after_minutes} y "
+            f"{agent_config.test_second_reminder_after_minutes} min; "
+            "aprobación para escalar al director a los "
+            f"{agent_config.test_escalate_after_minutes} min; recordatorio al "
+            "director a los "
+            f"{agent_config.test_next_level_reminder_after_minutes} min; "
+            "Comercial/Delivery a los "
+            f"{agent_config.test_commercial_delivery_after_minutes} min y "
+            f"repetición cada {agent_config.test_repeat_after_minutes} min; "
+            f"objetivo SLA {agent_config.test_sla_target_minutes} min; "
+            "comprobación cada "
             f"{agent_config.sla_check_interval_seconds} s."
         )
     else:
         print(
-            "Modo SLA normal: recordatorio a las "
-            f"{agent_config.reminder_after_hours} h y escalamiento a las "
-            f"{agent_config.escalate_after_hours} h."
+            "Modo SLA normal: avisos al PM a las "
+            f"{agent_config.reminder_after_hours} y "
+            f"{agent_config.second_reminder_after_hours} h; aprobación para "
+            "escalar al director a las "
+            f"{agent_config.escalate_after_hours} h; recordatorio al director "
+            f"a las {agent_config.next_level_reminder_after_hours} h; "
+            "Comercial/Delivery a las "
+            f"{agent_config.commercial_delivery_after_hours} h y repetición "
+            f"cada {agent_config.repeat_after_hours} h."
         )
 
     if args.simulate:
@@ -304,7 +330,8 @@ def main() -> int:
 
     print(
         "Confirmación de PM simulada por perfil; puedes validar o corregir "
-        "cada solicitud con `confirm <n> sí|no`."
+        "si el PM se hará cargo con `confirm <n> sí|no`; marca el trabajo "
+        "terminado con `complete <n>`."
     )
     try:
         run_terminal_agent(

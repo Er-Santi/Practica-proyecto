@@ -4,7 +4,7 @@ from typing import Any, Iterable, Mapping
 
 from email_utils import normalize_text
 
-FINAL_STATES = {"Confirmada", "Cerrada"}
+FINAL_STATES = {"Cerrada"}
 
 
 def count_open_projects(

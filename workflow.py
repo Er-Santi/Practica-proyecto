@@ -185,12 +185,24 @@ def build_graph(
                             break
 
             if llm_result is not None:
-                category = llm_result["categoria"]
-                reason = (
-                    llm_result.get("motivo")
-                    or f"Clasificado por el modelo OpenRouter {llm.model}."
-                )
-                classification_method = "openrouter"
+                if (
+                    rule_category == "solicitud_posicion"
+                    and llm_result["categoria"] == "no_relacionado"
+                ):
+                    category = rule_category
+                    reason = (
+                        f"Las reglas encontraron una necesidad explícita de personal "
+                        f"({rule_reason}), aunque OpenRouter la marcó como "
+                        "no relacionada."
+                    )
+                    classification_method = "reglas_validacion"
+                else:
+                    category = llm_result["categoria"]
+                    reason = (
+                        llm_result.get("motivo")
+                        or f"Clasificado por el modelo OpenRouter {llm.model}."
+                    )
+                    classification_method = "openrouter"
             else:
                 category = rule_category
                 reason = rule_reason
@@ -836,8 +848,8 @@ def build_graph(
             )
             events.append(event)
             print(
-                f"[CONFIRMACIÓN SIMULADA] {request['pm_responsable']} confirmó "
-                f"la recepción de: {request['asunto']}."
+                f"[CONFIRMACIÓN SIMULADA] {request['pm_responsable']} "
+                f"aceptó hacerse cargo de: {request['asunto']}."
             )
 
         return {

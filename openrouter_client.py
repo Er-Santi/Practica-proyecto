@@ -41,8 +41,9 @@ class OpenRouterClient:
             "por ejemplo 'we need 4 full stack engineers', una descripción de puesto "
             "con número de vacantes, o una tabla con rol y total de posiciones. "
             "Usa 'actualizacion_solicitud' cuando una respuesta de PM aporte/corrija "
-            "datos, diga que ya está trabajando, confirme que se atendió o cierre/cancele "
-            "una solicitud conocida; un simple acuse de recibo es duplicado. "
+            "datos, acepte hacerse cargo, diga que ya está trabajando, o informe que "
+            "se completó/cerró/canceló una solicitud conocida; un simple acuse de "
+            "recibo sin aceptación es duplicado. "
             "Usa 'duplicado' para una repetición/acuse sin información nueva y "
             "'no_relacionado' para lo demás. Usa referencias e identificadores para "
             "relacionar actualizaciones con known_requests. Extrae el cliente, el rol, "
@@ -59,8 +60,8 @@ class OpenRouterClient:
             "cantidad_posiciones, pm_responsable, posiciones, estado_solicitud, motivo, "
             "pregunta_confirmacion, preguntas_aclaracion. cantidad_posiciones debe ser "
             "entero o null; posiciones es lista o []. estado_solicitud solo puede ser "
-            "'escalada' si el PM confirma que está trabajando, 'confirmada' si afirma "
-            "que la solicitud ya fue atendida, 'cerrada' si la cancela/cierra, o null."
+            "'escalada' si el PM confirma que está trabajando, 'confirmada' si acepta "
+            "hacerse cargo, 'cerrada' si ya se completó o se cancela/cierra, o null."
         )
         result = self._request_json(system_prompt, prompt_data)
 
@@ -144,8 +145,8 @@ class OpenRouterClient:
             "posiciones sin cambios y conserva los roles/skills en el idioma original. "
             "No conviertas tarifas ni años de experiencia en cantidad de puestos. "
             "estado_solicitud es 'escalada' si informa que ya está trabajando, "
-            "'confirmada' si ya atendió la solicitud, 'cerrada' si la canceló/cerró "
-            "o null si no comunica un cambio de estado."
+            "'confirmada' si acepta hacerse cargo de la solicitud, 'cerrada' si la "
+            "completó o canceló/cerró, o null si no comunica un cambio de estado."
         )
         result = self._request_json(system_prompt, prompt_data)
 

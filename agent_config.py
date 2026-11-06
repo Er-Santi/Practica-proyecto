@@ -12,7 +12,7 @@ from settings import CONFIG_PATH
 @dataclass(frozen=True)
 class AgentConfig:
     reminder_after_hours: int = 4
-    escalate_after_hours: int = 8
+    escalate_after_hours: int = 16
     sla_target_hours: int = 8
     max_simulated_hours: int = 48
     recursion_limit: int = 16
@@ -20,9 +20,18 @@ class AgentConfig:
     max_open_projects_per_pm: int = 10
     testing_enabled: bool = False
     test_reminder_after_minutes: int = 1
-    test_escalate_after_minutes: int = 2
+    test_escalate_after_minutes: int = 4
     test_sla_target_minutes: int = 3
     sla_check_interval_seconds: int = 5
+    second_reminder_after_hours: int = 8
+    next_level_reminder_after_hours: int = 24
+    commercial_delivery_after_hours: int = 32
+    repeat_after_hours: int = 2
+    test_second_reminder_after_minutes: int = 2
+    test_next_level_reminder_after_minutes: int = 6
+    test_commercial_delivery_after_minutes: int = 8
+    test_repeat_after_minutes: int = 2
+    llm_enabled: bool = True
 
     def __post_init__(self) -> None:
         _positive_integer(
@@ -61,6 +70,26 @@ class AgentConfig:
             maximum=1000,
         )
         _positive_integer(
+            self.second_reminder_after_hours,
+            name="sla.second_reminder_after_hours",
+            maximum=48,
+        )
+        _positive_integer(
+            self.next_level_reminder_after_hours,
+            name="sla.next_level_reminder_after_hours",
+            maximum=48,
+        )
+        _positive_integer(
+            self.commercial_delivery_after_hours,
+            name="sla.commercial_delivery_after_hours",
+            maximum=48,
+        )
+        _positive_integer(
+            self.repeat_after_hours,
+            name="sla.repeat_after_hours",
+            maximum=48,
+        )
+        _positive_integer(
             self.test_reminder_after_minutes,
             name="testing.reminder_after_minutes",
             maximum=48 * 60,
@@ -80,24 +109,56 @@ class AgentConfig:
             name="testing.check_interval_seconds",
             maximum=3600,
         )
+        _positive_integer(
+            self.test_second_reminder_after_minutes,
+            name="testing.second_reminder_after_minutes",
+            maximum=48 * 60,
+        )
+        _positive_integer(
+            self.test_next_level_reminder_after_minutes,
+            name="testing.next_level_reminder_after_minutes",
+            maximum=48 * 60,
+        )
+        _positive_integer(
+            self.test_commercial_delivery_after_minutes,
+            name="testing.commercial_delivery_after_minutes",
+            maximum=48 * 60,
+        )
+        _positive_integer(
+            self.test_repeat_after_minutes,
+            name="testing.repeat_after_minutes",
+            maximum=48 * 60,
+        )
         if self.recursion_limit < 6:
             raise ValueError(
                 "simulation.recursion_limit debe ser al menos 6 para ejecutar "
                 "una vuelta completa del grafo."
             )
-        if self.reminder_after_hours >= self.escalate_after_hours:
+        if not (
+            self.reminder_after_hours
+            < self.second_reminder_after_hours
+            < self.escalate_after_hours
+            < self.next_level_reminder_after_hours
+            < self.commercial_delivery_after_hours
+        ):
             raise ValueError(
-                "sla.reminder_after_hours debe ser menor que "
-                "sla.escalate_after_hours."
+                "Los hitos SLA deben estar en orden: primer recordatorio, "
+                "segundo recordatorio, escalamiento a director, recordatorio "
+                "al siguiente nivel e involucrar comercial/delivery."
             )
         if self.sla_target_hours > self.max_simulated_hours:
             raise ValueError(
                 "sla.target_hours no puede superar simulation.max_hours."
             )
-        if self.test_reminder_after_minutes >= self.test_escalate_after_minutes:
+        if not (
+            self.test_reminder_after_minutes
+            < self.test_second_reminder_after_minutes
+            < self.test_escalate_after_minutes
+            < self.test_next_level_reminder_after_minutes
+            < self.test_commercial_delivery_after_minutes
+        ):
             raise ValueError(
-                "testing.reminder_after_minutes debe ser menor que "
-                "testing.escalate_after_minutes."
+                "Los hitos SLA de prueba deben estar en orden ascendente."
             )
 def _read_section(
     payload: dict[str, Any],
@@ -147,14 +208,22 @@ def load_agent_config(path: Path = CONFIG_PATH) -> AgentConfig:
     sla = _read_section(
         payload,
         "sla",
-        {"reminder_after_hours", "escalate_after_hours", "target_hours"},
+        {
+            "reminder_after_hours",
+            "second_reminder_after_hours",
+            "escalate_after_hours",
+            "next_level_reminder_after_hours",
+            "commercial_delivery_after_hours",
+            "repeat_after_hours",
+            "target_hours",
+        },
     )
     simulation = _read_section(
         payload,
         "simulation",
         {"max_hours", "recursion_limit"},
     )
-    llm = _read_section(payload, "llm", {"max_calls"})
+    llm = _read_section(payload, "llm", {"enabled", "max_calls"})
     assignment = _read_section(
         payload,
         "assignment",
@@ -166,7 +235,11 @@ def load_agent_config(path: Path = CONFIG_PATH) -> AgentConfig:
         {
             "enabled",
             "reminder_after_minutes",
+            "second_reminder_after_minutes",
             "escalate_after_minutes",
+            "next_level_reminder_after_minutes",
+            "commercial_delivery_after_minutes",
+            "repeat_after_minutes",
             "sla_target_minutes",
             "check_interval_seconds",
         },
@@ -174,6 +247,9 @@ def load_agent_config(path: Path = CONFIG_PATH) -> AgentConfig:
     testing_enabled = testing.get("enabled", False)
     if not isinstance(testing_enabled, bool):
         raise ValueError("testing.enabled debe ser true o false.")
+    llm_enabled = llm.get("enabled", True)
+    if not isinstance(llm_enabled, bool):
+        raise ValueError("llm.enabled debe ser true o false.")
 
     config = AgentConfig(
         reminder_after_hours=_positive_integer(
@@ -182,7 +258,7 @@ def load_agent_config(path: Path = CONFIG_PATH) -> AgentConfig:
             maximum=48,
         ),
         escalate_after_hours=_positive_integer(
-            sla.get("escalate_after_hours", 8),
+            sla.get("escalate_after_hours", 16),
             name="sla.escalate_after_hours",
             maximum=48,
         ),
@@ -211,6 +287,26 @@ def load_agent_config(path: Path = CONFIG_PATH) -> AgentConfig:
             name="assignment.max_open_projects_per_pm",
             maximum=1000,
         ),
+        second_reminder_after_hours=_positive_integer(
+            sla.get("second_reminder_after_hours", 8),
+            name="sla.second_reminder_after_hours",
+            maximum=48,
+        ),
+        next_level_reminder_after_hours=_positive_integer(
+            sla.get("next_level_reminder_after_hours", 24),
+            name="sla.next_level_reminder_after_hours",
+            maximum=48,
+        ),
+        commercial_delivery_after_hours=_positive_integer(
+            sla.get("commercial_delivery_after_hours", 32),
+            name="sla.commercial_delivery_after_hours",
+            maximum=48,
+        ),
+        repeat_after_hours=_positive_integer(
+            sla.get("repeat_after_hours", 2),
+            name="sla.repeat_after_hours",
+            maximum=48,
+        ),
         testing_enabled=testing_enabled,
         test_reminder_after_minutes=_positive_integer(
             testing.get("reminder_after_minutes", 1),
@@ -218,7 +314,7 @@ def load_agent_config(path: Path = CONFIG_PATH) -> AgentConfig:
             maximum=48 * 60,
         ),
         test_escalate_after_minutes=_positive_integer(
-            testing.get("escalate_after_minutes", 2),
+            testing.get("escalate_after_minutes", 4),
             name="testing.escalate_after_minutes",
             maximum=48 * 60,
         ),
@@ -227,6 +323,27 @@ def load_agent_config(path: Path = CONFIG_PATH) -> AgentConfig:
             name="testing.sla_target_minutes",
             maximum=48 * 60,
         ),
+        test_second_reminder_after_minutes=_positive_integer(
+            testing.get("second_reminder_after_minutes", 2),
+            name="testing.second_reminder_after_minutes",
+            maximum=48 * 60,
+        ),
+        test_next_level_reminder_after_minutes=_positive_integer(
+            testing.get("next_level_reminder_after_minutes", 6),
+            name="testing.next_level_reminder_after_minutes",
+            maximum=48 * 60,
+        ),
+        test_commercial_delivery_after_minutes=_positive_integer(
+            testing.get("commercial_delivery_after_minutes", 8),
+            name="testing.commercial_delivery_after_minutes",
+            maximum=48 * 60,
+        ),
+        test_repeat_after_minutes=_positive_integer(
+            testing.get("repeat_after_minutes", 2),
+            name="testing.repeat_after_minutes",
+            maximum=48 * 60,
+        ),
+        llm_enabled=llm_enabled,
         sla_check_interval_seconds=_positive_integer(
             testing.get("check_interval_seconds", 5),
             name="testing.check_interval_seconds",
