@@ -11,6 +11,7 @@ from agent_config import AgentConfig
 from agent_state import AgentState
 from audit_log import JsonlAuditLog, audit_error
 from email_utils import normalize_text
+from exceptions import AgentMailError, OpenRouterError
 
 SLA_STOP_STATES = frozenset({"Confirmada", "Cerrada"})
 
@@ -161,6 +162,9 @@ def process_due_sla_actions(
         Callable[[dict[str, Any]], dict[str, Any] | None] | None
     ) = None,
     approval_graph: Any | None = None,
+    reminder_email_handler: (
+        Callable[[dict[str, Any]], dict[str, Any]] | None
+    ) = None,
 ) -> int:
     director_by_client = {
         normalize_text(str(client)): str(director)
@@ -237,6 +241,51 @@ def process_due_sla_actions(
         print(output)
         actions += 1
 
+    def send_first_reminder_email(request: dict[str, Any]) -> None:
+        if (
+            simulated
+            or not config.reminder_email_enabled
+            or reminder_email_handler is None
+            or request.get("correo_recordatorio_real_enviado", False)
+        ):
+            return
+        try:
+            email_details = reminder_email_handler(request)
+        except (AgentMailError, OpenRouterError) as exc:
+            event = audit_error(
+                audit,
+                exc,
+                node="enviar_recordatorio_real",
+                hora_simulada=state["hora_actual"],
+                solicitud=request["id"],
+                details={
+                    "destinatario": config.reminder_email_recipient,
+                    "reintentar": True,
+                },
+            )
+            state["eventos"].append(event)
+            print(
+                f"[ERROR CORREO RECORDATORIO] No se pudo enviar a "
+                f"{config.reminder_email_recipient}: {exc}"
+            )
+            return
+
+        request["correo_recordatorio_real_enviado"] = True
+        event = {
+            "hora_simulada": state["hora_actual"],
+            "solicitud": request["id"],
+            "nodo": "enviar_recordatorio_real",
+            "decision": "recordatorio_real_enviado",
+            "motivo": "Se envió el primer recordatorio SLA por correo real.",
+            "datos": email_details,
+        }
+        audit.append(event)
+        state["eventos"].append(event)
+        print(
+            f"[CORREO REAL] Recordatorio enviado a "
+            f"{config.reminder_email_recipient}."
+        )
+
     def elapsed_threshold_value(elapsed_hours: float) -> float:
         return elapsed_hours * 60 if testing_minutes else elapsed_hours
 
@@ -312,6 +361,8 @@ def process_due_sla_actions(
                     f"{request.get('asunto', request['id'])}"
                 ),
             )
+            if request.get("numero_notificacion_seguimiento") == 1:
+                send_first_reminder_email(request)
 
         if (
             elapsed_for_thresholds >= thresholds["second_reminder"]

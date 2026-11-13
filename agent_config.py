@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,8 @@ class AgentConfig:
     test_commercial_delivery_after_minutes: int = 8
     test_repeat_after_minutes: int = 2
     llm_enabled: bool = True
+    reminder_email_enabled: bool = False
+    reminder_email_recipient: str = ""
 
     def __post_init__(self) -> None:
         _positive_integer(
@@ -160,6 +163,20 @@ class AgentConfig:
             raise ValueError(
                 "Los hitos SLA de prueba deben estar en orden ascendente."
             )
+        if not isinstance(self.reminder_email_enabled, bool):
+            raise ValueError("reminder_email.enabled debe ser true o false.")
+        if self.reminder_email_enabled and (
+            not isinstance(self.reminder_email_recipient, str)
+            or not re.fullmatch(
+                r"[^@\s]+@[^@\s]+\.[^@\s]+",
+                self.reminder_email_recipient,
+            )
+        ):
+            raise ValueError(
+                "reminder_email.recipient debe ser una dirección de correo válida."
+            )
+
+
 def _read_section(
     payload: dict[str, Any],
     name: str,
@@ -199,6 +216,7 @@ def load_agent_config(path: Path = CONFIG_PATH) -> AgentConfig:
         "llm",
         "assignment",
         "testing",
+        "reminder_email",
     }
     if unknown_sections:
         raise ValueError(
@@ -244,12 +262,23 @@ def load_agent_config(path: Path = CONFIG_PATH) -> AgentConfig:
             "check_interval_seconds",
         },
     )
+    reminder_email = _read_section(
+        payload,
+        "reminder_email",
+        {"enabled", "recipient"},
+    )
     testing_enabled = testing.get("enabled", False)
     if not isinstance(testing_enabled, bool):
         raise ValueError("testing.enabled debe ser true o false.")
     llm_enabled = llm.get("enabled", True)
     if not isinstance(llm_enabled, bool):
         raise ValueError("llm.enabled debe ser true o false.")
+    reminder_email_enabled = reminder_email.get("enabled", False)
+    if not isinstance(reminder_email_enabled, bool):
+        raise ValueError("reminder_email.enabled debe ser true o false.")
+    reminder_email_recipient = reminder_email.get("recipient", "")
+    if not isinstance(reminder_email_recipient, str):
+        raise ValueError("reminder_email.recipient debe ser texto.")
 
     config = AgentConfig(
         reminder_after_hours=_positive_integer(
@@ -344,6 +373,8 @@ def load_agent_config(path: Path = CONFIG_PATH) -> AgentConfig:
             maximum=48 * 60,
         ),
         llm_enabled=llm_enabled,
+        reminder_email_enabled=reminder_email_enabled,
+        reminder_email_recipient=reminder_email_recipient.strip(),
         sla_check_interval_seconds=_positive_integer(
             testing.get("check_interval_seconds", 5),
             name="testing.check_interval_seconds",

@@ -14,11 +14,16 @@ simulation:
 
 llm:
   # false: clasifica por reglas y usa mensajes de plantilla, sin OpenRouter.
-  enabled: false
+  enabled: true
   max_calls: 60
+
+reminder_email:
+  enabled: true
+  recipient: santiagovargasquesada17@gmail.com
 
 assignment:
   max_open_projects_per_pm: 10
+  # La elegibilidad individual se guarda en la columna elegible de pms.csv.
 
 testing:
   enabled: true

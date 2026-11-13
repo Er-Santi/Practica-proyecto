@@ -47,6 +47,7 @@ from service import (
     run_agent_forever,
     run_phase_one,
     run_simulation,
+    set_pm_eligibility,
 )
 from settings import (
     API_BASE_URL,
@@ -122,6 +123,7 @@ __all__ = [
     "run_agent_forever",
     "run_phase_one",
     "run_simulation",
+    "set_pm_eligibility",
     "run_terminal_agent",
     "serialize_agentmail_message",
     "simulated_confirmation_delay",
@@ -246,7 +248,10 @@ def main() -> int:
         )
         assignments = load_assignments(args.assignments)
         directors = load_director_assignments(args.assignments)
-        pm_profiles = load_pm_profiles(args.profiles)
+        pm_profiles = load_pm_profiles(
+            args.profiles,
+            pm_addresses=assignments.values(),
+        )
         client = AgentMailClient(api_key, inbox_id)
         llm = OpenRouterClient(openrouter_key, args.model) if use_llm else None
     except ValueError as exc:
@@ -274,6 +279,22 @@ def main() -> int:
         )
     else:
         print("OpenRouter está desactivado; se utilizarán las reglas de respaldo.")
+    if args.simulate:
+        print("Simulación: no se enviarán correos reales de recordatorio.")
+    elif agent_config.reminder_email_enabled:
+        writing_mode = (
+            "OpenRouter con respaldo por plantilla"
+            if llm
+            else "plantilla genérica"
+        )
+        print(
+            "Correo real del primer recordatorio SLA habilitado para "
+            f"{agent_config.reminder_email_recipient}; redacción: {writing_mode}."
+        )
+    else:
+        print(
+            "El envío de recordatorios reales está deshabilitado en config.yaml."
+        )
     if agent_config.testing_enabled:
         print(
             "Modo de prueba SLA activo: avisos al PM a los "
@@ -345,6 +366,7 @@ def main() -> int:
             state_path=args.state,
             config=agent_config,
             directors=directors,
+            profiles_path=args.profiles,
         )
     except KeyboardInterrupt:
         print("\nAgente detenido.")

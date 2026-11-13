@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -10,8 +11,9 @@ from audit_log import JsonlAuditLog, audit_error
 from email_utils import (
     _ordered_by_timestamp, classify_by_rules, clarification_questions,
     confirmation_question, extract_request_details, get_message_id, get_sender,
-    infer_request_status, load_assignments, load_director_assignments,
-    load_pm_profiles, message_text,
+    get_sender_address,
+    associate_pm_email_addresses, infer_request_status, load_assignments,
+    load_director_assignments, load_pm_profiles, message_text,
     normalize_text, request_fingerprint,
     simulated_confirmation_delay,
 )
@@ -22,8 +24,13 @@ from settings import (
     DEFAULT_SIMULATION_SEED,
     configured_max_llm_calls,
 )
-from pm_assignment import select_least_loaded_pm
-from pm_assignment import count_open_projects
+from pm_assignment import (
+    build_pm_roster,
+    canonical_pm_name,
+    count_open_projects,
+    is_pm_eligible,
+    select_least_loaded_pm,
+)
 from sla import process_due_sla_actions
 
 def build_graph(
@@ -49,18 +56,120 @@ def build_graph(
         if directors is not None
         else load_director_assignments()
     )
-    pm_roster = tuple(sorted(set(pm_by_client.values()), key=str.casefold))
     assignment_issue_report = JsonlAuditLog(
         audit.path.with_name(ASSIGNMENT_REPORT_PATH.name)
     )
     profiles_by_pm = (
         {
-            normalize_text(str(pm)): dict(profile)
+            normalize_text(str(pm)): {
+                **dict(profile),
+                "nombre": str(profile.get("nombre") or pm).strip(),
+            }
             for pm, profile in pm_profiles.items()
         }
         if pm_profiles is not None
-        else load_pm_profiles()
+        else load_pm_profiles(pm_addresses=pm_by_client.values())
     )
+    associate_pm_email_addresses(profiles_by_pm, pm_by_client.values())
+
+    def available_pm_roster() -> tuple[str, ...]:
+        return build_pm_roster(pm_by_client, profiles_by_pm)
+
+    def sender_pm_reply_name(email: Mapping[str, Any]) -> str | None:
+        sender_address = get_sender_address(email)
+        if not sender_address:
+            return None
+
+        def addresses_for(profile: Mapping[str, Any]) -> list[str]:
+            addresses = profile.get("emails") or []
+            if isinstance(addresses, str):
+                addresses = [addresses]
+            return [
+                str(address).strip().casefold()
+                for address in addresses
+            ]
+
+        profile = next(
+            (
+                profile
+                for profile in profiles_by_pm.values()
+                if sender_address in addresses_for(profile)
+            ),
+            None,
+        )
+        if profile is None:
+            return None
+        headers = email.get("headers")
+        header_values = (
+            {
+                normalize_text(str(key)): str(value)
+                for key, value in headers.items()
+            }
+            if isinstance(headers, Mapping)
+            else {}
+        )
+        has_thread_metadata = bool(
+            email.get("in_reply_to")
+            or email.get("references")
+            or header_values.get("in reply to")
+            or header_values.get("references")
+        )
+        has_reply_subject = bool(
+            re.match(
+                r"^\s*(?:(?:re|fw|fwd)\s*:\s*)+",
+                str(email.get("subject") or ""),
+                flags=re.IGNORECASE,
+            )
+        )
+        if not has_thread_metadata and not has_reply_subject:
+            return None
+        return str(profile.get("nombre") or "")
+
+    def related_request_for_pm_reply(
+        email: Mapping[str, Any],
+        pm_name: str,
+        requests: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        canonical_sender = normalize_text(
+            canonical_pm_name(pm_name, profiles_by_pm)
+        )
+        assigned_requests = [
+            request
+            for request in requests
+            if request.get("pm_responsable")
+            and request.get("estado") not in {"Cerrada", "Completada"}
+            and normalize_text(
+                canonical_pm_name(
+                    str(request["pm_responsable"]),
+                    profiles_by_pm,
+                )
+            )
+            == canonical_sender
+        ]
+        reply_subject = normalize_text(str(email.get("subject") or ""))
+        reply_subject = re.sub(
+            r"^(?:(?:re|fw|fwd)\s*:\s*)+",
+            "",
+            reply_subject,
+        )
+        reply_subject = re.sub(
+            r"(?:recordatorio de seguimiento:\s*)+",
+            "",
+            reply_subject,
+        )
+        reply_subject = re.sub(r"\basunto:\s*", "", reply_subject)
+        subject_matches = [
+            request
+            for request in assigned_requests
+            if normalize_text(str(request.get("asunto") or ""))
+            .removeprefix("asunto: ")
+            in reply_subject
+        ]
+        if len(subject_matches) == 1:
+            return subject_matches[0]
+        if len(assigned_requests) == 1:
+            return assigned_requests[0]
+        return None
 
     def record(
         state: AgentState,
@@ -160,6 +269,30 @@ def build_graph(
 
         for email in state["correos_nuevos"]:
             identifier = get_message_id(email)
+            sender_address = get_sender_address(email)
+            configured_inbox = str(client.inbox_id).strip().casefold()
+            if sender_address and sender_address == configured_inbox:
+                classified_email = {
+                    **email,
+                    "categoria": "correo_saliente_ignorado",
+                }
+                classified.append(classified_email)
+                processed_ids.append(identifier)
+                events.append(
+                    record(
+                        state,
+                        identifier=identifier,
+                        node="clasificar_por_reglas",
+                        decision="correo_saliente_ignorado",
+                        reason=(
+                            "Se ignoró un mensaje enviado desde el inbox del "
+                            "agente; no es una solicitud entrante."
+                        ),
+                        details={"remitente": sender_address},
+                    )
+                )
+                continue
+            pm_reply_name = sender_pm_reply_name(email)
             rule_category, rule_reason = classify_by_rules(
                 email,
                 known_fingerprints=known_fingerprints,
@@ -184,7 +317,14 @@ def build_graph(
                         ):
                             break
 
-            if llm_result is not None:
+            if pm_reply_name is not None:
+                category = "actualizacion_solicitud"
+                reason = (
+                    f"Respuesta en hilo de {pm_reply_name}; se procesa como "
+                    "actualización para no volver a crear una solicitud."
+                )
+                classification_method = "reglas_respuesta_pm"
+            elif llm_result is not None:
                 if (
                     rule_category == "solicitud_posicion"
                     and llm_result["categoria"] == "no_relacionado"
@@ -243,6 +383,20 @@ def build_graph(
                 reply_to = email.get("in_reply_to")
                 if reply_to:
                     related_ids.add(str(reply_to))
+                headers = email.get("headers")
+                if isinstance(headers, Mapping):
+                    for header_name, header_value in headers.items():
+                        if normalize_text(str(header_name)) in {
+                            "in reply to",
+                            "references",
+                        }:
+                            related_ids.update(
+                                str(value)
+                                for value in re.findall(
+                                    r"<[^>]+>|[^\s,]+",
+                                    str(header_value),
+                                )
+                            )
                 related_id = (
                     llm_result.get("solicitud_relacionada_id")
                     if llm_result is not None
@@ -257,6 +411,14 @@ def build_graph(
                         ),
                         None,
                     )
+                if related_id is None and pm_reply_name is not None:
+                    related_request = related_request_for_pm_reply(
+                        email,
+                        pm_reply_name,
+                        requests_found,
+                    )
+                    if related_request is not None:
+                        related_id = related_request["id"]
 
                 target_request = next(
                     (
@@ -316,8 +478,16 @@ def build_graph(
                             requests_found,
                             str(proposed_pm),
                             exclude_request_id=target_request["id"],
+                            pm_profiles=profiles_by_pm,
                         )
-                        if pm_load < agent_config.max_open_projects_per_pm:
+                        proposed_pm_eligible = is_pm_eligible(
+                            str(proposed_pm),
+                            profiles_by_pm,
+                        )
+                        if (
+                            pm_load < agent_config.max_open_projects_per_pm
+                            and proposed_pm_eligible
+                        ):
                             target_request["pm_responsable"] = str(proposed_pm)
                         else:
                             events.append(
@@ -328,11 +498,16 @@ def build_graph(
                                     decision="asignacion_pm_rechazada_por_limite",
                                     reason=(
                                         f"Se rechazó asignar al PM {proposed_pm}: "
-                                        f"ya tiene {pm_load} proyectos abiertos."
+                                        + (
+                                            f"tiene {pm_load} proyectos abiertos."
+                                            if proposed_pm_eligible
+                                            else "está marcado como no elegible."
+                                        )
                                     ),
                                     details={
                                         "pm_responsable": proposed_pm,
                                         "proyectos_abiertos": pm_load,
+                                        "elegible": proposed_pm_eligible,
                                         "limite_proyectos_abiertos": (
                                             agent_config.max_open_projects_per_pm
                                         ),
@@ -358,10 +533,11 @@ def build_graph(
                     ):
                         selected_pm, _ = select_least_loaded_pm(
                             requests_found,
-                            pm_roster,
+                            available_pm_roster(),
                             maximum_open_projects=(
                                 agent_config.max_open_projects_per_pm
                             ),
+                            pm_profiles=profiles_by_pm,
                         )
                         target_request["pm_responsable"] = selected_pm
                     target_request["datos_faltantes"] = [
@@ -374,6 +550,32 @@ def build_graph(
                         )
                         if value is None
                     ]
+                    human_review_fields = [
+                        field
+                        for field in ("rol", "cantidad_posiciones")
+                        if field in target_request["datos_faltantes"]
+                    ]
+                    was_under_human_review = target_request.get(
+                        "revision_humana",
+                        False,
+                    )
+                    target_request["revision_humana"] = bool(
+                        human_review_fields
+                    )
+                    target_request["campos_revision_humana"] = (
+                        human_review_fields
+                    )
+                    if was_under_human_review and not human_review_fields:
+                        resolved_at = datetime.now(timezone.utc).isoformat()
+                        target_request["fecha_revision_humana_resuelta"] = (
+                            resolved_at
+                        )
+                        if target_request.get("estado") == "Nueva":
+                            target_request["estado"] = "Notificada"
+                            target_request["hora_notificacion"] = (
+                                state["hora_actual"]
+                            )
+                            target_request["fecha_notificacion"] = resolved_at
                     target_request["preguntas_aclaracion"] = (
                         llm_result.get("preguntas_aclaracion", [])
                         if llm_result
@@ -492,8 +694,9 @@ def build_graph(
                         )
                 selected_pm, pm_loads = select_least_loaded_pm(
                     requests_found,
-                    pm_roster,
+                    available_pm_roster(),
                     maximum_open_projects=agent_config.max_open_projects_per_pm,
+                    pm_profiles=profiles_by_pm,
                 )
                 details["pm_responsable"] = selected_pm
                 details["datos_faltantes"] = [
@@ -583,6 +786,11 @@ def build_graph(
                 fingerprints.append(fingerprint)
                 known_request_ids.add(identifier)
                 request_ids.append(identifier)
+                human_review_fields = [
+                    field
+                    for field in ("rol", "cantidad_posiciones")
+                    if field in details["datos_faltantes"]
+                ]
                 requests_found.append(
                     {
                         "id": identifier,
@@ -613,6 +821,9 @@ def build_graph(
                                 }
                             )
                         ),
+                        "revision_humana": bool(human_review_fields),
+                        "campos_revision_humana": human_review_fields,
+                        "correo_revision_humana_enviado": False,
                         "perfil_pm": None,
                         "horas_esperadas_confirmacion": None,
                         "hora_confirmacion": None,
@@ -696,13 +907,203 @@ def build_graph(
             for request in state["solicitudes"]
         }
         events: list[dict[str, Any]] = []
+        llm_calls = state["llamadas_llm"]
         for email in state["clasificacion_actual"]:
             identifier = get_message_id(email)
+            human_review_fields: list[str] = []
+            writing_method: str | None = None
             if email["categoria"] == "solicitud_posicion":
                 request = requests_by_id[identifier]
                 recipient = request["pm_responsable"]
                 questions = request.get("preguntas_aclaracion", [])
-                if recipient:
+                human_review_fields = [
+                    field
+                    for field in ("rol", "cantidad_posiciones")
+                    if field in (request.get("datos_faltantes") or [])
+                ]
+                if human_review_fields:
+                    request["revision_humana"] = True
+                    request["campos_revision_humana"] = human_review_fields
+                    profile = profiles_by_pm.get(
+                        normalize_text(str(recipient or "")),
+                        {},
+                    )
+                    profile_emails = profile.get("emails") or []
+                    if isinstance(profile_emails, str):
+                        profile_emails = [profile_emails]
+                    raw_addresses = [
+                        *profile_emails,
+                        profile.get("correo"),
+                        recipient,
+                    ]
+                    recipient_email = next(
+                        (
+                            str(address).strip().casefold()
+                            for address in raw_addresses
+                            if isinstance(address, str)
+                            and re.fullmatch(
+                                r"[^@\s]+@[^@\s]+\.[^@\s]+",
+                                address.strip(),
+                            )
+                        ),
+                        None,
+                    )
+                    if not recipient:
+                        decision = "revision_humana_sin_pm"
+                        reason = (
+                            "La solicitud requiere revisión humana porque falta "
+                            "el rol o la cantidad, pero no hay un PM asignado."
+                        )
+                        request["revision_humana_motivo"] = reason
+                    elif recipient_email is None:
+                        decision = "revision_humana_sin_correo_pm"
+                        reason = (
+                            f"La solicitud requiere revisión humana y se asignó "
+                            f"a {recipient}, pero no hay un correo válido "
+                            "configurado para ese PM."
+                        )
+                        request["revision_humana_motivo"] = reason
+                    elif state["simular_confirmacion_automatica"]:
+                        decision = "revision_humana_pendiente"
+                        reason = (
+                            "La solicitud requiere revisión humana; en modo "
+                            "simulación no se envió un correo real al PM."
+                        )
+                        request["revision_humana_motivo"] = reason
+                        print(
+                            "[REVISIÓN HUMANA SIMULADA] "
+                            f"Para: {recipient} ({recipient_email}) | "
+                            "Falta completar: "
+                            + ", ".join(human_review_fields)
+                        )
+                    else:
+                        body: str | None = None
+                        writing_method = "plantilla"
+                        if llm is not None:
+                            writer = getattr(
+                                llm,
+                                "write_clarification_email",
+                                None,
+                            )
+                            for attempt in range(2):
+                                if (
+                                    llm_call_limit
+                                    and llm_calls >= llm_call_limit
+                                ):
+                                    break
+                                llm_calls += 1
+                                try:
+                                    if not callable(writer):
+                                        raise OpenRouterError(
+                                            "El cliente LLM no puede redactar "
+                                            "correos de aclaración."
+                                        )
+                                    body = writer(email, request)
+                                    writing_method = "llm"
+                                    break
+                                except OpenRouterError as exc:
+                                    error_event = audit_error(
+                                        audit,
+                                        exc,
+                                        node="redactar_aclaracion_llm",
+                                        hora_simulada=state["hora_actual"],
+                                        solicitud=identifier,
+                                        details={
+                                            "intento": attempt + 1,
+                                            "respaldo_por_plantilla": True,
+                                        },
+                                    )
+                                    events.append(error_event)
+
+                            if (
+                                body is None
+                                and llm_call_limit
+                                and llm_calls >= llm_call_limit
+                            ):
+                                events.append(
+                                    audit_error(
+                                        audit,
+                                        "Se alcanzó el límite de llamadas a OpenRouter.",
+                                        node="redactar_aclaracion_llm",
+                                        hora_simulada=state["hora_actual"],
+                                        solicitud=identifier,
+                                        details={
+                                            "limite": llm_call_limit,
+                                            "respaldo_por_plantilla": True,
+                                        },
+                                    )
+                                )
+
+                        if body is None:
+                            lines = [
+                                f"Hola {recipient},",
+                                "",
+                                "Esta solicitud requiere revisión humana porque "
+                                "falta información clave:",
+                                f"ID: {identifier}",
+                                f"Asunto: {request['asunto']}",
+                                f"Remitente original: {get_sender(email)}",
+                            ]
+                            for label, key in (
+                                ("Cliente", "cliente"),
+                                ("Rol", "rol"),
+                                ("Cantidad de posiciones", "cantidad_posiciones"),
+                            ):
+                                value = request.get(key)
+                                if value is not None and str(value).strip():
+                                    lines.append(f"{label}: {value}")
+                            lines.extend(
+                                [
+                                    "",
+                                    "Datos por confirmar: "
+                                    + ", ".join(human_review_fields),
+                                    "Por favor revisa el correo original y confirma "
+                                    "el dato faltante o indica qué debemos preguntar "
+                                    "al remitente.",
+                                ]
+                            )
+                            if questions:
+                                lines.extend(
+                                    ["", "Preguntas sugeridas:", *questions]
+                                )
+                            original_body = str(
+                                email.get("text")
+                                or email.get("extracted_text")
+                                or email.get("preview")
+                                or ""
+                            ).strip()
+                            if original_body:
+                                if len(original_body) > 2000:
+                                    original_body = original_body[:1997] + "..."
+                                lines.extend(
+                                    ["", "Mensaje original:", original_body]
+                                )
+                            body = "\n".join(lines)
+
+                        subject_text = " ".join(
+                            str(request.get("asunto") or identifier).split()
+                        )[:120]
+                        subject = (
+                            f"Revisión humana [Solicitud {identifier}]: "
+                            f"{subject_text}"
+                        )
+                        client.send(recipient_email, subject, body)
+                        request["correo_revision_humana_enviado"] = True
+                        request["fecha_correo_revision_humana"] = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
+                        decision = "correo_revision_humana_enviado"
+                        reason = (
+                            f"Se envió al PM {recipient} un correo para revisar "
+                            "la solicitud ambigua."
+                        )
+                        request["revision_humana_motivo"] = reason
+                        print(
+                            f"[REVISIÓN HUMANA] Correo enviado a {recipient} "
+                            f"({recipient_email}); falta confirmar: "
+                            f"{', '.join(human_review_fields)}."
+                        )
+                elif recipient:
                     request["hora_notificacion"] = state["hora_actual"]
                     request["fecha_notificacion"] = datetime.now(
                         timezone.utc
@@ -757,17 +1158,27 @@ def build_graph(
                 record(
                     state,
                     identifier=identifier,
-                    node="notificar_pm_simulado",
+                    node=(
+                        "notificar_revision_humana_pm"
+                        if human_review_fields
+                        else "notificar_pm_simulado"
+                    ),
                     decision=decision,
                     reason=reason,
                     details=(
                         {
                             "cliente": request["cliente"],
                             "pm_responsable": request["pm_responsable"],
-                            "hora_notificacion": request["hora_notificacion"],
+                            "hora_notificacion": request.get("hora_notificacion"),
                             "estado": request["estado"],
                             "datos_faltantes": request.get("datos_faltantes", []),
                             "preguntas_aclaracion": questions,
+                            "revision_humana": request.get(
+                                "revision_humana",
+                                False,
+                            ),
+                            "campos_revision_humana": human_review_fields,
+                            "metodo_redaccion": writing_method,
                         }
                         if email["categoria"] == "solicitud_posicion"
                         else None
@@ -776,6 +1187,7 @@ def build_graph(
             )
         return {
             "solicitudes": list(requests_by_id.values()),
+            "llamadas_llm": llm_calls,
             "eventos": [*state["eventos"], *events],
         }
 

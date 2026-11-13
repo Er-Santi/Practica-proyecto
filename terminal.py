@@ -1,7 +1,7 @@
 import threading
 from queue import Empty, Full, Queue
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, MutableMapping
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -14,11 +14,13 @@ from email_utils import (
     get_message_id,
     get_sender,
     load_director_assignments,
+    load_pm_profiles,
     normalize_text,
 )
 from exceptions import AgentMailError, OpenRouterError
 from openrouter_client import OpenRouterClient
 from pm_assignment import count_open_projects
+from pm_assignment import build_pm_roster, is_pm_eligible
 from service import (
     apply_human_confirmation,
     apply_pm_update,
@@ -27,9 +29,11 @@ from service import (
     close_request,
     mark_request_opened,
     run_agent_forever,
+    set_pm_eligibility,
 )
 from settings import (
     DEFAULT_SIMULATION_SEED,
+    PM_PROFILES_PATH,
     REQUEST_TIMEOUT_SECONDS,
     STATE_PATH,
     configured_max_llm_calls,
@@ -125,11 +129,12 @@ def run_terminal_agent(
     reconnect_interval: float,
     assignments: Mapping[str, str] | None = None,
     llm: OpenRouterClient | None = None,
-    pm_profiles: Mapping[str, Mapping[str, Any]] | None = None,
+    pm_profiles: MutableMapping[str, dict[str, Any]] | None = None,
     simulation_seed: int = DEFAULT_SIMULATION_SEED,
     state_path: Path = STATE_PATH,
     config: AgentConfig | None = None,
     directors: Mapping[str, str] | None = None,
+    profiles_path: Path = PM_PROFILES_PATH,
 ) -> None:
     agent_config = config or load_agent_config()
     director_contacts = (
@@ -278,6 +283,25 @@ def run_terminal_agent(
                     "[INFORMACIÓN PENDIENTE] "
                     + ", ".join(request["datos_faltantes"])
                 )
+            if request.get("revision_humana"):
+                print(
+                    "[REVISIÓN HUMANA PENDIENTE] Falta confirmar: "
+                    + ", ".join(request.get("campos_revision_humana", []))
+                )
+                if request.get("correo_revision_humana_enviado"):
+                    print(
+                        "[REVISIÓN HUMANA] Se envió un correo al PM asignado."
+                    )
+                else:
+                    print(
+                        "[REVISIÓN HUMANA] "
+                        + str(
+                            request.get(
+                                "revision_humana_motivo",
+                                "No se envió un correo de revisión al PM.",
+                            )
+                        )
+                    )
             print(f"[PREGUNTA DE IA] {request['pregunta_confirmacion']}")
             for question in request["preguntas_aclaracion"]:
                 print(f"[ACLARACIÓN DE IA] {question}")
@@ -310,6 +334,7 @@ def run_terminal_agent(
                 state_path=state_path,
                 initial_state=state_snapshot,
                 config=agent_config,
+                profiles_path=profiles_path,
                 approval_handler=wait_for_director_approval,
             )
         except Exception as exc:
@@ -364,11 +389,12 @@ def run_terminal_agent(
                         "  history, historial  Consulta solicitudes cerradas o completadas\n"
                         "  status              Muestra hora, correos y solicitudes detectadas\n"
                         "  assign <n> <PM>     Asigna un PM a una solicitud de esta sesión\n"
+                        "  pm-eligibility <PM> si|no  Habilita/deshabilita un PM; al deshabilitarlo reasigna solicitudes activas\n"
                         "  pm <n>              Escribe en lenguaje natural la respuesta del PM\n"
                         "  confirm <n> sí|no   Confirma si el PM se hará cargo de la solicitud\n"
                         "  approve <n> sí|no [motivo]  Aprueba o rechaza el escalamiento al director\n"
-                        "  complete <n>        Marca como terminado el trabajo de una solicitud\n"
-                        "  close <n>           Cierra una solicitud cancelada\n"
+                        "  complete <n> <razón>  Marca como terminado el trabajo de una solicitud\n"
+                        "  close <n> <razón>     Cierra una solicitud cancelada (número de status)\n"
                         "  help, h, ?          Ayuda\n"
                         "  stop, quit, q       Detiene el agente"
                     )
@@ -386,19 +412,23 @@ def run_terminal_agent(
                         f"Finalizadas: {sum(request['estado'] == 'Cerrada' for request in state['solicitudes'])} | "
                         f"Llamadas OpenRouter: {llm_usage}"
                     )
-                    pm_roster = sorted(
-                        set((assignments or {}).values()),
-                        key=str.casefold,
+                    pm_roster = build_pm_roster(
+                        assignments,
+                        pm_profiles,
+                        eligible_only=False,
                     )
                     if pm_roster:
-                        print("Carga abierta por PM:")
+                        print("PMs y carga abierta:")
                         for pm_name in pm_roster:
                             open_projects = count_open_projects(
                                 state["solicitudes"],
                                 pm_name,
+                                pm_profiles=pm_profiles,
                             )
                             print(
-                                f"  {pm_name}: {open_projects}/"
+                                f"  {pm_name}: "
+                                f"{'elegible' if is_pm_eligible(pm_name, pm_profiles) else 'NO ELEGIBLE'} | "
+                                f"{open_projects}/"
                                 f"{agent_config.max_open_projects_per_pm}"
                             )
                     else:
@@ -438,6 +468,114 @@ def run_terminal_agent(
                         )
                         if final_date:
                             print(f"    Fecha de finalización: {final_date}")
+                        if request.get("razon_finalizacion"):
+                            print(
+                                f"    Razón: {request['razon_finalizacion']}"
+                            )
+                elif normalized.startswith(
+                    (
+                        "pm-eligibility ",
+                        "pm-status ",
+                        "elegibilidad_pm ",
+                    )
+                ):
+                    parts = command.split()
+                    if len(parts) < 3:
+                        print(
+                            "Uso: pm-eligibility <nombre del PM> si|no."
+                        )
+                        continue
+                    pm_name = " ".join(parts[1:-1])
+                    if not pm_name:
+                        print(
+                            "Indica el nombre del PM sin dejarlo vacío."
+                        )
+                        continue
+                    eligibility_value = normalize_text(parts[-1])
+                    if eligibility_value in {
+                        "si",
+                        "yes",
+                        "eligible",
+                        "elegible",
+                        "available",
+                        "on",
+                    }:
+                        eligible = True
+                    elif eligibility_value in {
+                        "no",
+                        "ineligible",
+                        "no elegible",
+                        "inelegible",
+                        "unavailable",
+                        "off",
+                    }:
+                        eligible = False
+                    else:
+                        print("Indica `si` o `no` para la elegibilidad.")
+                        continue
+                    if pm_profiles is None:
+                        print(
+                            "No hay roster de PM cargado; configura el archivo "
+                            "de perfiles antes de cambiar elegibilidad."
+                        )
+                        continue
+                    try:
+                        with state_lock:
+                            latest_profiles = load_pm_profiles(
+                                profiles_path,
+                                pm_addresses=(assignments or {}).values(),
+                            )
+                            for profile_key, latest_profile in (
+                                latest_profiles.items()
+                            ):
+                                matching_key = next(
+                                    (
+                                        key
+                                        for key, current_profile in (
+                                            pm_profiles.items()
+                                        )
+                                        if normalize_text(str(key))
+                                        == normalize_text(profile_key)
+                                        or normalize_text(
+                                            str(
+                                                current_profile.get("nombre")
+                                                or ""
+                                            )
+                                        )
+                                        == normalize_text(
+                                            str(
+                                                latest_profile.get("nombre")
+                                                or ""
+                                            )
+                                        )
+                                    ),
+                                    None,
+                                )
+                                if matching_key is None:
+                                    pm_profiles[profile_key] = latest_profile
+                                else:
+                                    current_profile = pm_profiles[matching_key]
+                                    current_profile.clear()
+                                    current_profile.update(latest_profile)
+                            set_pm_eligibility(
+                                state_snapshot,
+                                pm_name=pm_name,
+                                eligible=eligible,
+                                pm_profiles=pm_profiles,
+                                profiles_path=profiles_path,
+                                assignments=assignments,
+                                audit=JsonlAuditLog(audit_path),
+                                simulation_seed=simulation_seed,
+                                config=agent_config,
+                            )
+                        persist_state()
+                    except (OSError, ValueError) as exc:
+                        print(f"No se pudo cambiar la elegibilidad del PM: {exc}")
+                        _audit_terminal_error(
+                            audit_path,
+                            "cambiar_elegibilidad_pm_terminal",
+                            exc,
+                        )
                 elif normalized.startswith(("confirm ", "confirmar ")):
                     parts = command.split()
                     if len(parts) != 3:
@@ -568,6 +706,7 @@ def run_terminal_agent(
                                 audit=JsonlAuditLog(audit_path),
                                 llm=llm,
                                 assignments=assignments,
+                                pm_profiles=pm_profiles,
                                 config=agent_config,
                             )
                         persist_state()
@@ -576,12 +715,14 @@ def run_terminal_agent(
                 elif normalized.startswith(
                     ("complete ", "completar ", "done ", "finalizar ")
                 ):
-                    parts = command.split()
-                    if len(parts) != 2:
-                        print("Uso: complete <número de solicitud>.")
+                    parts = command.split(maxsplit=2)
+                    if len(parts) != 3 or not parts[2].strip():
+                        print(
+                            "Uso: complete <número de solicitud> <razón en texto>."
+                        )
                         continue
                     try:
-                        request_index = int(parts[1])
+                        request_index = int(parts[1].removeprefix("#"))
                     except ValueError:
                         print("El número de solicitud debe ser un entero.")
                         continue
@@ -590,6 +731,7 @@ def run_terminal_agent(
                             complete_request(
                                 state_snapshot,
                                 request_number=request_index,
+                                reason=parts[2],
                                 audit=JsonlAuditLog(audit_path),
                             )
                         persist_state()
@@ -602,12 +744,15 @@ def run_terminal_agent(
                             request_number=request_index,
                         )
                 elif normalized.startswith(("close ", "cerrar ")):
-                    parts = command.split()
-                    if len(parts) != 2:
-                        print("Uso: close <número de solicitud>.")
+                    parts = command.split(maxsplit=2)
+                    if len(parts) != 3 or not parts[2].strip():
+                        print(
+                            "Uso: close <número de solicitud> <razón en texto> "
+                            "(usa el número mostrado por status)."
+                        )
                         continue
                     try:
-                        request_index = int(parts[1])
+                        request_index = int(parts[1].removeprefix("#"))
                     except ValueError:
                         print("El número de solicitud debe ser un entero.")
                         continue
@@ -616,9 +761,15 @@ def run_terminal_agent(
                             close_request(
                                 state_snapshot,
                                 request_number=request_index,
+                                reason=parts[2],
                                 audit=JsonlAuditLog(audit_path),
                             )
                         persist_state()
+                        request = state_snapshot["solicitudes"][request_index - 1]
+                        print(
+                            f"[CERRADA] Solicitud #{request_index}: "
+                            f"{request.get('asunto') or request.get('id')}."
+                        )
                     except (IndexError, ValueError) as exc:
                         print(f"No se pudo cerrar la solicitud: {exc}")
                         _audit_terminal_error(
