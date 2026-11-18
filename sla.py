@@ -165,6 +165,16 @@ def process_due_sla_actions(
     reminder_email_handler: (
         Callable[[dict[str, Any]], dict[str, Any]] | None
     ) = None,
+    notification_email_handler: (
+        Callable[
+            [dict[str, Any], str, str, dict[str, Any], str],
+            dict[str, Any],
+        ]
+        | None
+    ) = None,
+    approval_email_handler: (
+        Callable[[dict[str, Any]], dict[str, Any]] | None
+    ) = None,
 ) -> int:
     director_by_client = {
         normalize_text(str(client)): str(director)
@@ -239,6 +249,46 @@ def process_due_sla_actions(
         audit.append(event)
         state["eventos"].append(event)
         print(output)
+        if (
+            notification_type is not None
+            and not simulated
+            and notification_email_handler is not None
+        ):
+            try:
+                email_details = notification_email_handler(
+                    request,
+                    notification_type,
+                    reason,
+                    details,
+                    recipient or "",
+                )
+            except (AgentMailError, ValueError) as exc:
+                error = audit_error(
+                    audit,
+                    exc,
+                    node="enviar_notificacion_sla_por_correo",
+                    hora_simulada=state["hora_actual"],
+                    solicitud=request["id"],
+                    details={
+                        "tipo_notificacion": notification_type,
+                        "destinatario": recipient,
+                    },
+                )
+                state["eventos"].append(error)
+                print(f"[ERROR CORREO SLA] {exc}")
+            else:
+                request.setdefault("notificaciones_email", []).append(
+                    {
+                        "tipo": notification_type,
+                        **email_details,
+                    }
+                )
+        elif (
+            notification_type == "Primer recordatorio al PM"
+            and not simulated
+            and reminder_email_handler is not None
+        ):
+            send_first_reminder_email(request)
         actions += 1
 
     def send_first_reminder_email(request: dict[str, Any]) -> None:
@@ -457,6 +507,35 @@ def process_due_sla_actions(
                     }
                     audit.append(approval_event)
                     state["eventos"].append(approval_event)
+                    if not simulated and approval_email_handler is not None:
+                        try:
+                            email_details = approval_email_handler(payload)
+                        except (AgentMailError, ValueError) as exc:
+                            error = audit_error(
+                                audit,
+                                exc,
+                                node="enviar_solicitud_escalamiento_por_correo",
+                                hora_simulada=state["hora_actual"],
+                                solicitud=request["id"],
+                                details={
+                                    "destinatario": director,
+                                    "intento": payload["intento"],
+                                },
+                            )
+                            state["eventos"].append(error)
+                            print(f"[ERROR CORREO ESCALAMIENTO] {exc}")
+                        else:
+                            request["aprobacion_director_message_id"] = (
+                                email_details.get("message_id")
+                            )
+                            request.setdefault(
+                                "notificaciones_email", []
+                            ).append(
+                                {
+                                    "tipo": "aprobacion_director",
+                                    **email_details,
+                                }
+                            )
 
                 def record_no_approval_response(
                     payload: dict[str, Any],
@@ -489,16 +568,25 @@ def process_due_sla_actions(
                         or f"{request['id']}:director-approval:{attempt}"
                     )
                     approval_payload = make_approval_payload(attempt)
-                    approval_decision = request_director_approval(
-                        approval_graph_instance,
-                        thread_id=thread_id,
-                        payload=approval_payload,
-                        approval_handler=approval_handler,
-                        checkpoint_pending=request.get(
-                            "aprobacion_director_checkpoint_pendiente",
-                            False,
-                        ),
+                    email_decision = request.pop(
+                        "respuesta_aprobacion_director", None
                     )
+                    if (
+                        isinstance(email_decision, dict)
+                        and isinstance(email_decision.get("approved"), bool)
+                    ):
+                        approval_decision = email_decision
+                    else:
+                        approval_decision = request_director_approval(
+                            approval_graph_instance,
+                            thread_id=thread_id,
+                            payload=approval_payload,
+                            approval_handler=approval_handler,
+                            checkpoint_pending=request.get(
+                                "aprobacion_director_checkpoint_pendiente",
+                                False,
+                            ),
+                        )
                     if approval_decision is None and _approval_repeat_due(
                         request,
                         elapsed_for_thresholds=elapsed_for_thresholds,
@@ -634,6 +722,9 @@ def process_due_sla_actions(
                 )
                 request["nivel_maximo_escalamiento"] = "Director"
                 request["estado"] = "Escalada"
+                request["jefe_responsable"] = str(director or "")
+                request["responsable_actual"] = str(director or "")
+                request["escalada_a_jefe"] = True
                 record_action(
                     request,
                     decision=(

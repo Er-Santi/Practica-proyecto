@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 from dataclasses import replace
@@ -16,11 +17,15 @@ from email_utils import (
     _ordered_by_timestamp, associate_pm_email_addresses,
     clarification_questions, classify_by_rules, confirmation_question,
     detect_pm_unavailability, extract_request_details, get_message_id,
-    get_sender, infer_request_status,
-    load_assignments, load_director_assignments,
+    get_sender, get_sender_address, infer_request_status,
+    load_assignments, load_director_assignments, message_text,
     normalize_text, request_fingerprint, simulated_confirmation_delay,
 )
 from exceptions import AgentMailError, OpenRouterError
+from email_notifications import (
+    send_case_query_reply,
+    send_lifecycle_notification,
+)
 from openrouter_client import OpenRouterClient
 from pm_assignment import (
     build_pm_roster,
@@ -43,6 +48,30 @@ from sla import (
 )
 from state_store import load_agent_state, save_agent_state
 from workflow import build_graph
+
+
+def _subject_identifies_request(subject: str, request_id: str) -> bool:
+    normalized_subject = normalize_text(subject)
+    normalized_id = normalize_text(request_id)
+    return bool(
+        normalized_id
+        and re.search(
+            rf"(?<!\w){re.escape(normalized_id)}(?!\w)",
+            normalized_subject,
+        )
+    )
+
+
+def _supersede_pm_assignment_emails(request: dict[str, Any]) -> None:
+    request.pop("notificacion_pm_message_id", None)
+    for notification in request.get("notificaciones_email", []):
+        if (
+            isinstance(notification, MutableMapping)
+            and notification.get("tipo")
+            in {"solicitud_asignada", "solicitud_reasignada"}
+        ):
+            notification["superseded"] = True
+
 
 def apply_human_confirmation(
     state: AgentState,
@@ -211,6 +240,7 @@ def set_pm_eligibility(
     audit: JsonlAuditLog,
     simulation_seed: int = DEFAULT_SIMULATION_SEED,
     config: AgentConfig | None = None,
+    reassign_open_requests: bool = True,
 ) -> AgentState:
     canonical_name = canonical_pm_name(pm_name, pm_profiles)
     normalized_pm = normalize_text(canonical_name)
@@ -307,7 +337,7 @@ def set_pm_eligibility(
         )
 
     reassigned = 0
-    if not eligible:
+    if not eligible and reassign_open_requests:
         pm_roster = build_pm_roster(assignments, pm_profiles)
         for request_index, request in enumerate(state["solicitudes"], start=1):
             if (
@@ -326,6 +356,7 @@ def set_pm_eligibility(
                 pm_profiles=pm_profiles,
             )
             if replacement is None:
+                _supersede_pm_assignment_emails(request)
                 request["pm_responsable"] = None
                 request["estado"] = "Nueva"
                 request["hora_notificacion"] = None
@@ -458,6 +489,7 @@ def assign_pm_to_request(
             f"El PM {pm_name} ya tiene {current_load} proyectos abiertos; "
             f"el límite es {agent_config.max_open_projects_per_pm}."
         )
+    _supersede_pm_assignment_emails(request)
     request["pm_responsable"] = pm_name
     request["hora_notificacion"] = state["hora_actual"]
     request["fecha_notificacion"] = datetime.now(timezone.utc).isoformat()
@@ -586,7 +618,7 @@ def apply_pm_update(
         raise ValueError("Asigna un PM antes de registrar su respuesta.")
 
     agent_config = config or load_agent_config()
-    if llm is not None:
+    if llm is not None and agent_config.llm_enabled:
         limit = configured_max_llm_calls(agent_config.max_llm_calls)
         if limit and state["llamadas_llm"] >= limit:
             error = ValueError(
@@ -667,6 +699,7 @@ def apply_pm_update(
         request_statuses = {
             "escalada": "Escalada",
             "confirmada": "Confirmada",
+            "completada": "Cerrada",
             "cerrada": "Cerrada",
         }
         status = request_statuses.get(str(reported_status))
@@ -685,8 +718,15 @@ def apply_pm_update(
         if status == "Confirmada":
             request["fecha_confirmacion"] = request["fecha_cambio_estado"]
             request["hora_confirmacion"] = state["hora_actual"]
+            request["aprobacion_director_pendiente"] = False
+            request["aprobacion_director_checkpoint_pendiente"] = False
+            request["escalamiento_ausencia_pendiente"] = False
+            request.pop("aprobacion_director_thread_id", None)
         elif status == "Cerrada":
             request["fecha_cierre"] = request["fecha_cambio_estado"]
+            request["razon_finalizacion"] = response_text.strip()
+            if reported_status == "completada":
+                request["fecha_completada"] = request["fecha_cambio_estado"]
     if updates.get("posiciones"):
         request["posiciones"] = updates["posiciones"]
         if updates.get("cantidad_posiciones") is None:
@@ -780,6 +820,7 @@ def process_due_reminders(
     now: datetime | None = None,
     config: AgentConfig | None = None,
     directors: Mapping[str, str] | None = None,
+    pm_profiles: Mapping[str, Mapping[str, Any]] | None = None,
     mail_client: AgentMailClient | None = None,
     llm: OpenRouterClient | None = None,
     approval_handler: (
@@ -788,101 +829,130 @@ def process_due_reminders(
     approval_graph: Any | None = None,
 ) -> int:
     agent_config = config or load_agent_config()
+    loaded_profiles = pm_profiles or {}
 
-    def send_reminder_email(request: dict[str, Any]) -> dict[str, Any]:
+    def profile_email(pm_name: str) -> str | None:
+        profiles = loaded_profiles or {}
+        normalized_pm = normalize_text(pm_name)
+        profile = next(
+            (
+                item
+                for key, item in profiles.items()
+                if normalized_pm
+                in {
+                    normalize_text(str(key)),
+                    normalize_text(str(item.get("nombre") or "")),
+                    *(
+                        normalize_text(str(address))
+                        for address in item.get("emails", [])
+                    ),
+                }
+            ),
+            None,
+        )
+        if profile is None:
+            return None
+        addresses = profile.get("emails") or []
+        if isinstance(addresses, str):
+            addresses = [addresses]
+        return next(
+            (
+                str(address).strip().casefold()
+                for address in addresses
+                if isinstance(address, str)
+                and "@" in address
+            ),
+            None,
+        )
+
+    def send_sla_notification(
+        request: dict[str, Any],
+        notification_type: str,
+        reason: str,
+        details: dict[str, Any],
+        recipient: str,
+    ) -> dict[str, Any]:
         if mail_client is None:
             raise AgentMailError(
-                "No se configuró el cliente para enviar el recordatorio real."
+                "No se configuró el cliente para enviar notificaciones por correo."
             )
-
-        subject_text = " ".join(
-            str(request.get("asunto") or request["id"]).split()
-        )[:160]
-        subject = f"Recordatorio de seguimiento: {subject_text}"
-        body: str | None = None
-        method = "plantilla"
-        llm_call_limit = configured_max_llm_calls(agent_config.max_llm_calls)
-        if llm is not None:
-            for attempt in range(2):
-                if (
-                    llm_call_limit
-                    and state["llamadas_llm"] >= llm_call_limit
-                ):
-                    break
-                state["llamadas_llm"] += 1
-                try:
-                    body = llm.write_reminder_email(request)
-                    method = "llm"
-                    break
-                except OpenRouterError as exc:
-                    error_event = audit_error(
-                        audit,
-                        exc,
-                        node="redactar_recordatorio_llm",
-                        hora_simulada=state["hora_actual"],
-                        solicitud=request["id"],
-                        details={
-                            "intento": attempt + 1,
-                            "respaldo_por_plantilla": True,
-                        },
-                    )
-                    state["eventos"].append(error_event)
-
-            if body is None and llm_call_limit and (
-                state["llamadas_llm"] >= llm_call_limit
-            ):
-                error_event = audit_error(
-                    audit,
-                    "Se alcanzó el límite de llamadas a OpenRouter.",
-                    node="redactar_recordatorio_llm",
-                    hora_simulada=state["hora_actual"],
-                    solicitud=request["id"],
-                    details={
-                        "limite": llm_call_limit,
-                        "respaldo_por_plantilla": True,
-                    },
-                )
-                state["eventos"].append(error_event)
-
-        if body is None:
-            lines = [
-                "Hola,",
-                "",
-                "Este es un recordatorio de seguimiento sobre esta solicitud:",
-                f"ID: {request['id']}",
-                f"Asunto: {subject_text}",
-            ]
-            for label, key in (
-                ("Cliente", "cliente"),
-                ("Rol", "rol"),
-                ("Cantidad", "cantidad_posiciones"),
-                ("PM asignado", "pm_responsable"),
-            ):
-                value = request.get(key)
-                if value is not None and str(value).strip():
-                    lines.append(f"{label}: {value}")
-            lines.extend(
-                [
-                    "",
-                    "Por favor revisa la solicitud y comparte una actualización "
-                    "sobre su estado. Si ya fue atendida, confirma para actualizar "
-                    "el registro.",
-                    "",
-                    "Mensaje automático de seguimiento.",
-                ]
+        if notification_type == "Escalamiento aprobado al director":
+            recipient_email = str(request.get("correo_solicitante") or "").strip()
+            event_type = "solicitud_escalada"
+        elif (
+            notification_type == "Recordatorio al director"
+            or "escalamiento" in normalize_text(notification_type)
+            or request.get("escalada_a_jefe")
+        ):
+            recipient_email = agent_config.manager_email
+            event_type = (
+                "escalamiento_jefe"
+                if "escalamiento" in normalize_text(notification_type)
+                else "recordatorio"
             )
-            body = "\n".join(lines)
-
-        mail_client.send(
-            agent_config.reminder_email_recipient,
-            subject,
-            body,
+        else:
+            recipient_email = profile_email(str(request.get("pm_responsable") or ""))
+            event_type = "recordatorio"
+        if not recipient_email:
+            raise ValueError(
+                f"No hay correo configurado para el destinatario {recipient!r}."
+            )
+        email_details = send_lifecycle_notification(
+            mail_client,
+            recipient_email,
+            event_type,
+            request,
+            context={
+                "razon": reason,
+                "tipo_notificacion": notification_type,
+                **details,
+            },
+            state=state,
+            audit=audit,
+            config=agent_config,
+            llm=llm,
         )
-        return {
-            "destinatario": agent_config.reminder_email_recipient,
-            "asunto": subject,
-            "metodo_redaccion": method,
-        }
+        if notification_type == "Primer recordatorio al PM":
+            request["correo_recordatorio_real_enviado"] = True
+        email_details["destinatario_logico"] = recipient
+        return email_details
+
+    def send_approval_email(payload: dict[str, Any]) -> dict[str, Any]:
+        if mail_client is None:
+            raise AgentMailError(
+                "No se configuró el cliente para enviar el correo de escalamiento."
+            )
+        if not agent_config.manager_email:
+            raise ValueError("No hay correo configurado para el jefe.")
+        request = next(
+            (
+                item
+                for item in state["solicitudes"]
+                if item.get("id") == payload.get("solicitud")
+            ),
+            None,
+        )
+        if request is None:
+            raise ValueError(
+                f"No existe la solicitud {payload.get('solicitud')}."
+            )
+        return send_lifecycle_notification(
+            mail_client,
+            agent_config.manager_email,
+            "escalamiento_jefe",
+            request,
+            context={
+                "razon": request.get("motivo_escalamiento")
+                or "El PM no confirmó dentro del plazo SLA.",
+                "jefe": agent_config.manager_name,
+                "pregunta": payload.get("mensaje"),
+                "intento": payload.get("intento"),
+            },
+            state=state,
+            audit=audit,
+            config=agent_config,
+            llm=llm,
+        )
 
     return process_due_sla_actions(
         state,
@@ -897,8 +967,13 @@ def process_due_reminders(
         now=now,
         approval_handler=approval_handler,
         approval_graph=approval_graph,
-        reminder_email_handler=(
-            send_reminder_email
+        notification_email_handler=(
+            send_sla_notification
+            if mail_client is not None and agent_config.reminder_email_enabled
+            else None
+        ),
+        approval_email_handler=(
+            send_approval_email
             if mail_client is not None and agent_config.reminder_email_enabled
             else None
         ),
@@ -1125,6 +1200,148 @@ def run_agent_forever(
         if state_path is not None:
             save_agent_state(state_path, state)
 
+    def migrate_active_requests_to_roster() -> bool:
+        roster = build_pm_roster(assignments, pm_profiles)
+        if not roster:
+            return False
+        changed = False
+        for request in state["solicitudes"]:
+            if (
+                request.get("estado") == "Cerrada"
+                or request.get("escalada_a_jefe")
+                or request.get("jefe_responsable")
+            ):
+                continue
+            previous_pm = str(request.get("pm_responsable") or "")
+            if not previous_pm:
+                continue
+            canonical_previous = normalize_text(
+                canonical_pm_name(previous_pm, pm_profiles)
+            )
+            roster_names = {
+                normalize_text(canonical_pm_name(name, pm_profiles))
+                for name in roster
+            }
+            if canonical_previous in roster_names:
+                continue
+            replacement, loads = select_least_loaded_pm(
+                state["solicitudes"],
+                roster,
+                maximum_open_projects=agent_config.max_open_projects_per_pm,
+                pm_profiles=pm_profiles,
+            )
+            request["pm_anterior"] = previous_pm
+            if replacement is None:
+                _supersede_pm_assignment_emails(request)
+                request["pm_responsable"] = None
+                request["responsable_actual"] = None
+                request["estado"] = "Nueva"
+                if "pm_responsable" not in request.get("datos_faltantes", []):
+                    request.setdefault("datos_faltantes", []).append(
+                        "pm_responsable"
+                    )
+                decision = "solicitud_sin_pm_despues_de_migracion"
+                reason = (
+                    "El PM anterior ya no forma parte del roster y no hay PM "
+                    "elegible con capacidad."
+                )
+            else:
+                _supersede_pm_assignment_emails(request)
+                request["pm_responsable"] = replacement
+                request["responsable_actual"] = replacement
+                request["jefe_responsable"] = None
+                request["escalada_a_jefe"] = False
+                request["estado"] = "Notificada"
+                request["hora_notificacion"] = state["hora_actual"]
+                request["fecha_notificacion"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                for field in (
+                    "recordatorio_enviado",
+                    "segundo_recordatorio_enviado",
+                    "primer_recordatorio_enviado",
+                    "escalado_director",
+                    "recordatorio_siguiente_nivel_enviado",
+                    "comercial_delivery_involucrados",
+                ):
+                    request[field] = False
+                request["nivel_maximo_escalamiento"] = "Ninguno"
+                decision = "solicitud_reasignada_por_cambio_de_roster"
+                reason = (
+                    f"Se reasignó de {previous_pm} a {replacement} porque "
+                    "el PM anterior salió del roster."
+                )
+            event = {
+                "hora_simulada": state["hora_actual"],
+                "solicitud": request["id"],
+                "nodo": "migrar_roster_pm",
+                "decision": decision,
+                "motivo": reason,
+                "datos": {
+                    "pm_anterior": previous_pm,
+                    "pm_nuevo": replacement,
+                    "cargas_abiertas": loads,
+                },
+            }
+            audit.append(event)
+            state["eventos"].append(event)
+            changed = True
+            if replacement:
+                profile = next(
+                    (
+                        item
+                        for item in (pm_profiles or {}).values()
+                        if normalize_text(str(item.get("nombre") or ""))
+                        == normalize_text(replacement)
+                    ),
+                    {},
+                )
+                addresses = profile.get("emails") or []
+                if isinstance(addresses, str):
+                    addresses = [addresses]
+                recipient = next(
+                    (
+                        str(address).strip().casefold()
+                        for address in addresses
+                        if isinstance(address, str) and "@" in address
+                    ),
+                    None,
+                )
+                if recipient:
+                    try:
+                        details = send_lifecycle_notification(
+                            client,
+                            recipient,
+                            "solicitud_reasignada",
+                            request,
+                            context={"razon": reason},
+                            state=state,
+                            audit=audit,
+                            config=agent_config,
+                            llm=llm,
+                        )
+                    except (AgentMailError, ValueError) as exc:
+                        if isinstance(exc, ValueError):
+                            error = audit_error(
+                                audit,
+                                exc,
+                                node="notificar_migracion_roster",
+                                hora_simulada=state["hora_actual"],
+                                solicitud=request["id"],
+                            )
+                            state["eventos"].append(error)
+                        print(
+                            f"\n[ERROR CORREO MIGRACIÓN] {exc}"
+                        )
+                    else:
+                        request["notificacion_pm_message_id"] = (
+                            details.get("message_id")
+                        )
+                        request.setdefault("notificaciones_email", []).append(
+                            {"tipo": "solicitud_reasignada", **details}
+                        )
+        return changed
+
     def absence_already_recorded(identifier: str) -> bool:
         return any(
             event.get("decision") == "pm_marcado_no_elegible_por_ausencia"
@@ -1141,17 +1358,135 @@ def run_agent_forever(
             with lock:
                 if absence_already_recorded(identifier):
                     return True
-                set_pm_eligibility(
-                    state,
-                    pm_name=availability["pm_responsable"],
-                    eligible=False,
-                    pm_profiles=pm_profiles or {},
-                    profiles_path=profiles_path,
-                    assignments=assignments,
-                    audit=audit,
-                    simulation_seed=simulation_seed,
-                    config=agent_config,
+                absent_email = availability["correo_pm"].casefold()
+                matching_pm_names = [
+                    str(profile.get("nombre") or key)
+                    for key, profile in (pm_profiles or {}).items()
+                    if absent_email
+                    in {
+                        str(address).strip().casefold()
+                        for address in (profile.get("emails") or [])
+                    }
+                ] or [availability["pm_responsable"]]
+                references = message_references(message)
+                linked_requests = [
+                    request
+                    for request in state["solicitudes"]
+                    if request.get("estado") != "Cerrada"
+                    and (
+                        bool(
+                            references
+                            & {
+                                str(
+                                    request.get("notificacion_pm_message_id")
+                                    or ""
+                                )
+                                .strip()
+                                .strip("<>"),
+                                str(request.get("id") or "")
+                                .strip()
+                                .strip("<>"),
+                                *(
+                                    str(item.get("message_id") or "")
+                                    .strip()
+                                    .strip("<>")
+                                    for item in request.get(
+                                        "notificaciones_email", []
+                                    )
+                                    if isinstance(item, Mapping)
+                                    and not item.get("superseded")
+                                    and item.get("tipo")
+                                    in {
+                                        "solicitud_asignada",
+                                        "solicitud_reasignada",
+                                    }
+                                ),
+                            }
+                            - {""}
+                        )
+                        or (
+                            bool(request.get("id"))
+                            and _subject_identifies_request(
+                                str(message.get("subject") or ""),
+                                str(request["id"]),
+                            )
+                        )
+                    )
+                ]
+                linked_pm_names = list(
+                    dict.fromkeys(
+                        str(request.get("pm_responsable") or "").strip()
+                        for request in linked_requests
+                        if request.get("pm_responsable")
+                    )
                 )
+                if linked_pm_names:
+                    absent_pm_names = linked_pm_names
+                elif len(matching_pm_names) == 1:
+                    absent_pm_names = matching_pm_names
+                else:
+                    event = {
+                        "hora_simulada": state["hora_actual"],
+                        "solicitud": None,
+                        "nodo": "detectar_ausencia_pm",
+                        "decision": "respuesta_ausencia_pm_ambigua",
+                        "motivo": (
+                            "El correo indica ausencia, pero el remitente "
+                            "comparte dirección con varios PM y no se pudo "
+                            "identificar la solicitud relacionada."
+                        ),
+                        "datos": {
+                            "pm_candidatos": matching_pm_names,
+                            "correo_pm": absent_email,
+                            "message_id": identifier,
+                        },
+                    }
+                    audit.append(event)
+                    state["eventos"].append(event)
+                    state["correos_procesados"].append(identifier)
+                    state["correos_clasificados"].append(
+                        {
+                            **message,
+                            "categoria": "respuesta_ausencia_pm_ambigua",
+                        }
+                    )
+                    save_state_locked()
+                    on_state(state)
+                    print(
+                        "[REVISIÓN HUMANA] Se detectó una ausencia, pero no "
+                        "se deshabilitó ningún PM porque el correo es compartido "
+                        "y no se identificó la solicitud asociada."
+                    )
+                    return True
+                absent_pm_keys = {
+                    normalize_text(canonical_pm_name(name, pm_profiles))
+                    for name in absent_pm_names
+                }
+                affected_requests = [
+                    request
+                    for request in state["solicitudes"]
+                    if request.get("estado") != "Cerrada"
+                    and normalize_text(
+                        canonical_pm_name(
+                            str(request.get("pm_responsable") or ""),
+                            pm_profiles,
+                        )
+                    )
+                    in absent_pm_keys
+                ]
+                for pm_name in absent_pm_names:
+                    set_pm_eligibility(
+                        state,
+                        pm_name=pm_name,
+                        eligible=False,
+                        pm_profiles=pm_profiles or {},
+                        profiles_path=profiles_path,
+                        assignments=assignments,
+                        audit=audit,
+                        simulation_seed=simulation_seed,
+                        config=agent_config,
+                        reassign_open_requests=False,
+                    )
                 event = {
                     "hora_simulada": state["hora_actual"],
                     "solicitud": None,
@@ -1159,13 +1494,85 @@ def run_agent_forever(
                     "decision": "pm_marcado_no_elegible_por_ausencia",
                     "motivo": availability["motivo"],
                     "datos": {
-                        "pm_responsable": availability["pm_responsable"],
+                        "pm_responsables": absent_pm_names,
                         "correo_pm": availability["correo_pm"],
                         "message_id": identifier,
+                        "solicitudes_escaladas": [
+                            request["id"] for request in affected_requests
+                        ],
                     },
                 }
                 audit.append(event)
                 state["eventos"].append(event)
+                for request in affected_requests:
+                    old_pm = str(request.get("pm_responsable") or "")
+                    request["pm_anterior_por_ausencia"] = old_pm
+                    request["jefe_responsable"] = agent_config.manager_name
+                    request["responsable_actual"] = agent_config.manager_name
+                    request["escalada_a_jefe"] = True
+                    request["escalado_director"] = True
+                    request["escalamiento_ausencia_pendiente"] = True
+                    request["nivel_maximo_escalamiento"] = "Director"
+                    request["estado"] = "Escalada"
+                    request["motivo_escalamiento"] = availability["motivo"]
+                    request["fecha_escalamiento_director"] = (
+                        datetime.now(timezone.utc).isoformat()
+                    )
+                    if agent_config.manager_email:
+                        try:
+                            email_details = send_lifecycle_notification(
+                                client,
+                                agent_config.manager_email,
+                                "escalamiento_jefe",
+                                request,
+                                context={
+                                    "jefe": agent_config.manager_name,
+                                    "razon": availability["motivo"],
+                                    "pm_ausentes": absent_pm_names,
+                                    "pregunta": (
+                                        "Confirma si aceptarás hacerte cargo "
+                                        "respondiendo a este correo."
+                                    ),
+                                },
+                                state=state,
+                                audit=audit,
+                                config=agent_config,
+                                llm=llm,
+                            )
+                        except (AgentMailError, ValueError) as exc:
+                            if isinstance(exc, ValueError):
+                                error_event = audit_error(
+                                    audit,
+                                    exc,
+                                    node="escalar_ausencia_pm_por_correo",
+                                    hora_simulada=state["hora_actual"],
+                                    solicitud=request["id"],
+                                )
+                                state["eventos"].append(error_event)
+                            print(
+                                f"\n[ERROR CORREO AUSENCIA PM] {exc}"
+                            )
+                        else:
+                            request["aprobacion_director_message_id"] = (
+                                email_details.get("message_id")
+                            )
+                            request.setdefault(
+                                "notificaciones_email", []
+                            ).append(
+                                {
+                                    "tipo": "escalamiento_jefe",
+                                    **email_details,
+                                }
+                            )
+                    else:
+                        error_event = audit_error(
+                            audit,
+                            "No hay correo configurado para el jefe.",
+                            node="escalar_ausencia_pm_por_correo",
+                            hora_simulada=state["hora_actual"],
+                            solicitud=request["id"],
+                        )
+                        state["eventos"].append(error_event)
                 classified_message = {
                     **message,
                     "categoria": "respuesta_automatica_pm_no_disponible",
@@ -1189,8 +1596,8 @@ def run_agent_forever(
                 on_state(state)
             print(
                 f"\n[PM NO DISPONIBLE] {availability['pm_responsable']} "
-                f"({availability['correo_pm']}); se deshabilitó la asignación "
-                "y se reasignaron sus solicitudes activas."
+                f"({availability['correo_pm']}); dejó de recibir nuevas "
+                "solicitudes y sus casos activos se escalaron al jefe."
             )
             return True
         except (OSError, ValueError) as exc:
@@ -1226,6 +1633,445 @@ def run_agent_forever(
                     f"de {availability['pm_responsable']} previamente procesada."
                 )
                 process_pm_absence(message, availability)
+
+    def message_references(message: Mapping[str, Any]) -> set[str]:
+        values: list[str] = []
+        for key in ("in_reply_to", "references"):
+            raw_value = message.get(key)
+            if isinstance(raw_value, str):
+                values.extend(raw_value.split())
+            elif isinstance(raw_value, list):
+                values.extend(str(value) for value in raw_value)
+        headers = message.get("headers")
+        if isinstance(headers, Mapping):
+            for name, value in headers.items():
+                if normalize_text(str(name)) in {"in reply to", "references"}:
+                    values.extend(
+                        re.findall(r"<[^>]+>|[^\s,]+", str(value))
+                    )
+        return {
+            value.strip().strip("<>").strip()
+            for value in values
+            if value.strip().strip("<>").strip()
+        }
+
+    def sender_roles(sender_address: str) -> list[str]:
+        roles: list[str] = []
+        for profile in (pm_profiles or {}).values():
+            addresses = profile.get("emails") or []
+            if isinstance(addresses, str):
+                addresses = [addresses]
+            if sender_address in {
+                str(address).strip().casefold()
+                for address in addresses
+            }:
+                roles.append(str(profile.get("nombre") or ""))
+        if (
+            agent_config.manager_email
+            and sender_address == agent_config.manager_email.casefold()
+        ):
+            roles.append(agent_config.manager_name)
+        return list(dict.fromkeys(role for role in roles if role))
+
+    def handle_manager_approval(message: dict[str, Any]) -> bool:
+        sender_address = get_sender_address(message)
+        if (
+            not sender_address
+            or not agent_config.manager_email
+            or sender_address != agent_config.manager_email.casefold()
+        ):
+            return False
+        references = message_references(message)
+        body = "\n".join(
+            str(message.get(key) or "")
+            for key in ("text", "extracted_text", "preview")
+        )
+        body = "\n".join(
+            line for line in body.splitlines() if not line.lstrip().startswith(">")
+        )
+        normalized_body = normalize_text(body)
+        decision: bool | None = None
+        if re.search(
+            r"\b(no|rechazo|declino|no acepto|no puedo|"
+            r"i decline|i cannot|can't take)\b",
+            normalized_body,
+        ):
+            decision = False
+        elif re.search(
+            r"\b(si|yes|acepto|apruebo|aprobado|me hago cargo|"
+            r"me encargo|lo tomo|i accept|i approve|i can handle)\b",
+            normalized_body,
+        ):
+            decision = True
+        if decision is None:
+            return False
+
+        with lock:
+            def matches_pending_approval(
+                candidate: Mapping[str, Any],
+            ) -> bool:
+                approval_ids = {
+                    str(
+                        candidate.get("aprobacion_director_message_id") or ""
+                    ).strip().strip("<>"),
+                    *(
+                        str(item.get("message_id") or "")
+                        .strip()
+                        .strip("<>")
+                        for item in candidate.get("notificaciones_email", [])
+                        if isinstance(item, Mapping)
+                        and not item.get("superseded")
+                        and item.get("tipo")
+                        in {"escalamiento_jefe", "aprobacion_director"}
+                    ),
+                }
+                approval_ids.discard("")
+                has_pending_approval = bool(
+                    candidate.get("aprobacion_director_pendiente")
+                    or candidate.get("escalamiento_ausencia_pendiente")
+                )
+                subject_identifies_request = (
+                    bool(candidate.get("id"))
+                    and _subject_identifies_request(
+                        str(message.get("subject") or ""),
+                        str(candidate["id"]),
+                    )
+                )
+                return has_pending_approval and (
+                    bool(references.intersection(approval_ids))
+                    or (not references and subject_identifies_request)
+                )
+
+            request = next(
+                (
+                    candidate
+                    for candidate in state["solicitudes"]
+                    if matches_pending_approval(candidate)
+                    and candidate.get("estado") != "Cerrada"
+                ),
+                None,
+            )
+            if request is None:
+                return False
+            reason = body.strip() or (
+                "Erick aceptó el escalamiento."
+                if decision
+                else "Erick rechazó el escalamiento."
+            )
+            request["respuesta_aprobacion_director"] = {
+                "approved": decision,
+                "reason": reason,
+            }
+            if request.get("escalamiento_ausencia_pendiente"):
+                request["escalamiento_ausencia_pendiente"] = False
+                request["aprobacion_director_pendiente"] = False
+                if decision:
+                    request["jefe_responsable"] = agent_config.manager_name
+                    request["responsable_actual"] = agent_config.manager_name
+                    request["escalada_a_jefe"] = True
+                    request["escalado_director"] = True
+                    request["estado"] = "Confirmada"
+                    request["fecha_confirmacion"] = datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                    request["hora_confirmacion"] = state["hora_actual"]
+                    requester_email = str(
+                        request.get("correo_solicitante") or ""
+                    ).strip()
+                    if requester_email:
+                        try:
+                            details = send_lifecycle_notification(
+                                client,
+                                requester_email,
+                                "solicitud_escalada",
+                                request,
+                                context={
+                                    "jefe": agent_config.manager_name,
+                                    "razon": reason,
+                                },
+                                state=state,
+                                audit=audit,
+                                config=agent_config,
+                                llm=llm,
+                            )
+                        except (AgentMailError, ValueError) as exc:
+                            if isinstance(exc, ValueError):
+                                error_event = audit_error(
+                                    audit,
+                                    exc,
+                                    node="notificar_aprobacion_jefe",
+                                    hora_simulada=state["hora_actual"],
+                                    solicitud=request["id"],
+                                    details={
+                                        "destinatario": requester_email
+                                    },
+                                )
+                                state["eventos"].append(error_event)
+                            print(
+                                f"\n[ERROR CORREO ESCALAMIENTO] {exc}"
+                            )
+                        else:
+                            request.setdefault(
+                                "notificaciones_email", []
+                            ).append(
+                                {
+                                    "tipo": "solicitud_escalada",
+                                    **details,
+                                }
+                            )
+                else:
+                    replacement, loads = select_least_loaded_pm(
+                        state["solicitudes"],
+                        build_pm_roster(assignments, pm_profiles),
+                        maximum_open_projects=(
+                            agent_config.max_open_projects_per_pm
+                        ),
+                        pm_profiles=pm_profiles,
+                    )
+                    if replacement:
+                        _supersede_pm_assignment_emails(request)
+                        request["pm_responsable"] = replacement
+                        request["responsable_actual"] = replacement
+                        request["jefe_responsable"] = None
+                        request["escalada_a_jefe"] = False
+                        request["escalado_director"] = False
+                        request["nivel_maximo_escalamiento"] = "Ninguno"
+                        request["estado"] = "Notificada"
+                        request["hora_notificacion"] = state["hora_actual"]
+                        request["fecha_notificacion"] = datetime.now(
+                            timezone.utc
+                        ).isoformat()
+                        request["motivo_reasignacion"] = reason
+                        request["respuesta_aprobacion_director"] = None
+                        profile = next(
+                            (
+                                candidate
+                                for candidate in (pm_profiles or {}).values()
+                                if normalize_text(
+                                    str(candidate.get("nombre") or "")
+                                )
+                                == normalize_text(replacement)
+                            ),
+                            {},
+                        )
+                        addresses = profile.get("emails") or []
+                        if isinstance(addresses, str):
+                            addresses = [addresses]
+                        replacement_email = next(
+                            (
+                                str(address).strip().casefold()
+                                for address in addresses
+                                if isinstance(address, str)
+                                and "@" in address
+                            ),
+                            None,
+                        )
+                        if replacement_email:
+                            try:
+                                details = send_lifecycle_notification(
+                                    client,
+                                    replacement_email,
+                                    "solicitud_reasignada",
+                                    request,
+                                    context={
+                                        "razon": reason,
+                                        "cargas_abiertas": loads,
+                                    },
+                                    state=state,
+                                    audit=audit,
+                                    config=agent_config,
+                                    llm=llm,
+                                )
+                                request["notificacion_pm_message_id"] = (
+                                    details.get("message_id")
+                                )
+                                request.setdefault(
+                                    "notificaciones_email", []
+                                ).append(
+                                    {
+                                        "tipo": "solicitud_reasignada",
+                                        **details,
+                                    }
+                                )
+                            except (AgentMailError, ValueError) as exc:
+                                if isinstance(exc, ValueError):
+                                    error_event = audit_error(
+                                        audit,
+                                        exc,
+                                        node="notificar_reasignacion_por_rechazo",
+                                        hora_simulada=state["hora_actual"],
+                                        solicitud=request["id"],
+                                        details={
+                                            "destinatario": replacement_email
+                                        },
+                                    )
+                                    state["eventos"].append(error_event)
+                                print(
+                                    f"\n[ERROR CORREO REASIGNACIÓN] {exc}"
+                                )
+            event = {
+                "hora_simulada": state["hora_actual"],
+                "solicitud": request["id"],
+                "nodo": "respuesta_escalamiento_jefe_por_correo",
+                "decision": (
+                    "jefe_acepto_escalamiento"
+                    if decision
+                    else "jefe_rechazo_escalamiento"
+                ),
+                "motivo": reason,
+                "datos": {
+                    "jefe": agent_config.manager_name,
+                    "message_id": get_message_id(message),
+                    "escalada_a_jefe": request.get("escalada_a_jefe"),
+                    "responsable_actual": request.get("responsable_actual"),
+                },
+            }
+            audit.append(event)
+            state["eventos"].append(event)
+            state["correos_procesados"].append(get_message_id(message))
+            state["correos_clasificados"].append(
+                {
+                    **message,
+                    "categoria": "respuesta_escalamiento_jefe",
+                    "solicitud_id": request["id"],
+                }
+            )
+            save_state_locked()
+            on_state(state)
+        return True
+
+    def fallback_case_query(message: Mapping[str, Any]) -> bool:
+        text = normalize_text(
+            " ".join(
+                (
+                    str(message.get("subject") or ""),
+                    message_text(dict(message)),
+                )
+            )
+        )
+        return any(
+            phrase in text
+            for phrase in (
+                "mis casos",
+                "mis solicitudes",
+                "casos pendientes",
+                "solicitudes pendientes",
+                "lista de solicitudes",
+                "lista de mis casos",
+                "estado de mis solicitudes",
+                "estado de mis casos",
+                "que solicitudes tengo",
+                "que casos tengo",
+                "que tengo pendiente",
+                "que debo atender",
+                "status",
+                "my pending cases",
+                "my pending requests",
+                "what cases are assigned to me",
+                "what do i need to handle",
+                "list my cases",
+                "show my requests",
+            )
+        )
+
+    def handle_case_query(message: dict[str, Any]) -> bool:
+        sender_address = get_sender_address(message)
+        if not sender_address:
+            return False
+        roles = sender_roles(sender_address)
+        if not roles:
+            return False
+        query_result: bool | None = None
+        classifier = getattr(llm, "classify_case_query", None) if llm else None
+        with lock:
+            llm_calls = state["llamadas_llm"]
+        if llm is not None and agent_config.llm_enabled:
+            limit = configured_max_llm_calls(agent_config.max_llm_calls)
+            for attempt in range(2):
+                if limit and llm_calls >= limit:
+                    break
+                with lock:
+                    state["llamadas_llm"] += 1
+                    llm_calls = state["llamadas_llm"]
+                try:
+                    if not callable(classifier):
+                        raise OpenRouterError(
+                            "El cliente LLM no puede interpretar consultas de casos."
+                        )
+                    query_result = classifier(message)
+                    break
+                except OpenRouterError as exc:
+                    with lock:
+                        error = audit_error(
+                            audit,
+                            exc,
+                            node="clasificar_consulta_casos_llm",
+                            hora_simulada=state["hora_actual"],
+                            solicitud=get_message_id(message),
+                            details={
+                                "intento": attempt + 1,
+                                "respaldo_por_reglas": True,
+                            },
+                        )
+                        state["eventos"].append(error)
+        if query_result is None:
+            query_result = fallback_case_query(message)
+        if not query_result:
+            return False
+
+        role_keys = {
+            normalize_text(canonical_pm_name(role, pm_profiles))
+            for role in roles
+        }
+        with lock:
+            pending_requests = [
+                request
+                for request in state["solicitudes"]
+                if request.get("estado") != "Cerrada"
+                and any(
+                    request.get(field)
+                    and normalize_text(
+                        canonical_pm_name(str(request[field]), pm_profiles)
+                    )
+                    in role_keys
+                    for field in (
+                        "pm_responsable",
+                        "jefe_responsable",
+                        "responsable_actual",
+                    )
+                )
+            ]
+        identifier = get_message_id(message)
+        reply_sent = False
+        try:
+            send_case_query_reply(
+                client,
+                recipient=sender_address,
+                message_id=identifier,
+                requests=pending_requests,
+                state=state,
+                audit=audit,
+            )
+        except AgentMailError as exc:
+            print(f"\n[ERROR CORREO CONSULTA] No se pudo enviar respuesta: {exc}")
+        else:
+            reply_sent = True
+        with lock:
+            if reply_sent:
+                state["correos_procesados"].append(identifier)
+            state["correos_clasificados"].append(
+                {
+                    **message,
+                    "categoria": (
+                        "consulta_casos"
+                        if reply_sent
+                        else "consulta_casos_pendiente"
+                    ),
+                }
+            )
+            save_state_locked()
+            on_state(state)
+        return True
 
     async def process_message(
         message: dict[str, Any],
@@ -1265,6 +2111,10 @@ def run_agent_forever(
             return False
         if availability is not None and pm_profiles is not None:
             return process_pm_absence(message, availability)
+        if handle_manager_approval(message):
+            return True
+        if handle_case_query(message):
+            return True
 
         def invoke_graph() -> None:
             nonlocal state
@@ -1439,6 +2289,7 @@ def run_agent_forever(
                 audit=audit,
                 config=agent_config,
                 directors=directors,
+                pm_profiles=pm_profiles,
                 mail_client=client,
                 llm=llm,
                 approval_handler=(
@@ -1453,6 +2304,10 @@ def run_agent_forever(
 
     async def run_listener() -> AgentState:
         nonlocal state, next_heartbeat, next_reminder_check
+        with lock:
+            if migrate_active_requests_to_roster():
+                save_state_locked()
+                on_state(state)
         last_error: str | None = None
 
         while not stop_event.is_set():

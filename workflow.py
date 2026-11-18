@@ -18,6 +18,7 @@ from email_utils import (
     simulated_confirmation_delay,
 )
 from exceptions import AgentMailError, OpenRouterError
+from email_notifications import send_lifecycle_notification
 from openrouter_client import OpenRouterClient
 from settings import (
     ASSIGNMENT_REPORT_PATH,
@@ -75,10 +76,10 @@ def build_graph(
     def available_pm_roster() -> tuple[str, ...]:
         return build_pm_roster(pm_by_client, profiles_by_pm)
 
-    def sender_pm_reply_name(email: Mapping[str, Any]) -> str | None:
+    def sender_pm_reply_names(email: Mapping[str, Any]) -> list[str]:
         sender_address = get_sender_address(email)
         if not sender_address:
-            return None
+            return []
 
         def addresses_for(profile: Mapping[str, Any]) -> list[str]:
             addresses = profile.get("emails") or []
@@ -89,16 +90,11 @@ def build_graph(
                 for address in addresses
             ]
 
-        profile = next(
-            (
-                profile
-                for profile in profiles_by_pm.values()
-                if sender_address in addresses_for(profile)
-            ),
-            None,
-        )
-        if profile is None:
-            return None
+        matching_profiles = [
+            profile
+            for profile in profiles_by_pm.values()
+            if sender_address in addresses_for(profile)
+        ]
         headers = email.get("headers")
         header_values = (
             {
@@ -122,29 +118,44 @@ def build_graph(
             )
         )
         if not has_thread_metadata and not has_reply_subject:
-            return None
-        return str(profile.get("nombre") or "")
+            return []
+        names = [
+            str(profile.get("nombre") or "")
+            for profile in matching_profiles
+            if profile.get("nombre")
+        ]
+        if (
+            agent_config.manager_email
+            and sender_address == agent_config.manager_email.casefold()
+        ):
+            names.append(agent_config.manager_name)
+        return list(dict.fromkeys(names))
 
     def related_request_for_pm_reply(
         email: Mapping[str, Any],
-        pm_name: str,
+        pm_names: list[str],
         requests: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
-        canonical_sender = normalize_text(
-            canonical_pm_name(pm_name, profiles_by_pm)
-        )
+        canonical_senders = {
+            normalize_text(canonical_pm_name(name, profiles_by_pm))
+            for name in pm_names
+        }
         assigned_requests = [
             request
             for request in requests
-            if request.get("pm_responsable")
-            and request.get("estado") not in {"Cerrada", "Completada"}
-            and normalize_text(
-                canonical_pm_name(
-                    str(request["pm_responsable"]),
-                    profiles_by_pm,
+            if request.get("estado") not in {"Cerrada", "Completada"}
+            and any(
+                request.get(field)
+                and normalize_text(
+                    canonical_pm_name(str(request[field]), profiles_by_pm)
+                )
+                in canonical_senders
+                for field in (
+                    "pm_responsable",
+                    "jefe_responsable",
+                    "responsable_actual",
                 )
             )
-            == canonical_sender
         ]
         reply_subject = normalize_text(str(email.get("subject") or ""))
         reply_subject = re.sub(
@@ -292,7 +303,7 @@ def build_graph(
                     )
                 )
                 continue
-            pm_reply_name = sender_pm_reply_name(email)
+            pm_reply_names = sender_pm_reply_names(email)
             rule_category, rule_reason = classify_by_rules(
                 email,
                 known_fingerprints=known_fingerprints,
@@ -317,10 +328,11 @@ def build_graph(
                         ):
                             break
 
-            if pm_reply_name is not None:
+            if pm_reply_names:
                 category = "actualizacion_solicitud"
                 reason = (
-                    f"Respuesta en hilo de {pm_reply_name}; se procesa como "
+                    f"Respuesta en hilo de {', '.join(pm_reply_names)}; "
+                    "se procesa como "
                     "actualización para no volver a crear una solicitud."
                 )
                 classification_method = "reglas_respuesta_pm"
@@ -411,10 +423,38 @@ def build_graph(
                         ),
                         None,
                     )
-                if related_id is None and pm_reply_name is not None:
+                if related_id is None:
+                    related_id = next(
+                        (
+                            request["id"]
+                            for request in requests_found
+                            if related_ids.intersection(
+                                {
+                                    str(request.get("notificacion_pm_message_id") or ""),
+                                    str(
+                                        request.get(
+                                            "aprobacion_director_message_id"
+                                        )
+                                        or ""
+                                    ),
+                                    *(
+                                        str(item.get("message_id") or "")
+                                        for item in request.get(
+                                            "notificaciones_email", []
+                                        )
+                                        if isinstance(item, Mapping)
+                                        and not item.get("superseded")
+                                    ),
+                                }
+                                - {""}
+                            )
+                        ),
+                        None,
+                    )
+                if related_id is None and pm_reply_names:
                     related_request = related_request_for_pm_reply(
                         email,
-                        pm_reply_name,
+                        pm_reply_names,
                         requests_found,
                     )
                     if related_request is not None:
@@ -590,6 +630,7 @@ def build_graph(
                         state_labels = {
                             "escalada": "Escalada",
                             "confirmada": "Confirmada",
+                            "completada": "Cerrada",
                             "cerrada": "Cerrada",
                         }
                         target_request["estado"] = state_labels[reported_status]
@@ -610,10 +651,29 @@ def build_graph(
                             target_request["fecha_confirmacion"] = (
                                 target_request["fecha_cambio_estado"]
                             )
-                        elif reported_status == "cerrada":
+                            target_request[
+                                "aprobacion_director_pendiente"
+                            ] = False
+                            target_request[
+                                "aprobacion_director_checkpoint_pendiente"
+                            ] = False
+                            target_request[
+                                "escalamiento_ausencia_pendiente"
+                            ] = False
+                            target_request.pop(
+                                "aprobacion_director_thread_id", None
+                            )
+                        elif reported_status in {"cerrada", "completada"}:
                             target_request["fecha_cierre"] = (
                                 target_request["fecha_cambio_estado"]
                             )
+                            target_request["razon_finalizacion"] = (
+                                message_text(email).strip()
+                            )
+                            if reported_status == "completada":
+                                target_request["fecha_completada"] = (
+                                    target_request["fecha_cambio_estado"]
+                                )
                     updates = {
                         key: target_request.get(key)
                         for key in before
@@ -644,6 +704,79 @@ def build_graph(
                             details=details,
                         )
                     )
+                    status_email_type = {
+                        "escalada": "confirmacion_pm",
+                        "confirmada": "confirmacion_pm",
+                        "completada": "solicitud_completada",
+                        "cerrada": "solicitud_cerrada",
+                    }.get(str(reported_status))
+                    if (
+                        status_email_type
+                        and not state["simular_confirmacion_automatica"]
+                    ):
+                        recipient_emails = [
+                            str(target_request.get("correo_solicitante") or "")
+                        ]
+                        pm_profile = profiles_by_pm.get(
+                            normalize_text(
+                                str(target_request.get("pm_responsable") or "")
+                            ),
+                            {},
+                        )
+                        pm_emails = pm_profile.get("emails") or []
+                        if isinstance(pm_emails, str):
+                            pm_emails = [pm_emails]
+                        recipient_emails.extend(
+                            str(address)
+                            for address in pm_emails
+                            if isinstance(address, str)
+                        )
+                        if target_request.get("escalada_a_jefe"):
+                            recipient_emails.append(agent_config.manager_email)
+                        for recipient_email in dict.fromkeys(
+                            address.strip().casefold()
+                            for address in recipient_emails
+                            if address and "@" in address
+                        ):
+                            try:
+                                email_details = send_lifecycle_notification(
+                                    client,
+                                    recipient_email,
+                                    status_email_type,
+                                    target_request,
+                                    context={
+                                        "razon": message_text(email).strip(),
+                                        "actualizacion_pm": update_reason,
+                                    },
+                                    state=state,
+                                    audit=audit,
+                                    config=agent_config,
+                                    llm=llm,
+                                )
+                            except (AgentMailError, ValueError) as exc:
+                                if isinstance(exc, ValueError):
+                                    error_event = audit_error(
+                                        audit,
+                                        exc,
+                                        node="notificar_actualizacion_por_correo",
+                                        hora_simulada=state["hora_actual"],
+                                        solicitud=identifier,
+                                        details={
+                                            "tipo_evento": status_email_type,
+                                            "destinatario": recipient_email,
+                                        },
+                                    )
+                                    events.append(error_event)
+                            else:
+                                target_request.setdefault(
+                                    "notificaciones_email", []
+                                ).append(
+                                    {
+                                        "tipo": status_email_type,
+                                        **email_details,
+                                    }
+                                )
+                                llm_calls = state["llamadas_llm"]
                     known_requests = [
                         {
                             key: request.get(key)
@@ -795,11 +928,15 @@ def build_graph(
                     {
                         "id": identifier,
                         "remitente": get_sender(email),
+                        "correo_solicitante": get_sender_address(email) or None,
                         "asunto": str(email.get("subject") or "(sin asunto)"),
                         "cliente": details["cliente"],
                         "rol": details["rol"],
                         "cantidad_posiciones": details["cantidad_posiciones"],
                         "pm_responsable": details["pm_responsable"],
+                        "responsable_actual": details["pm_responsable"],
+                        "jefe_responsable": None,
+                        "escalada_a_jefe": False,
                         "posiciones": details.get("posiciones", []),
                         "datos_faltantes": details["datos_faltantes"],
                         "metodo_clasificacion": classification_method,
@@ -1110,36 +1247,90 @@ def build_graph(
                     ).isoformat()
                     if state["simular_confirmacion_automatica"]:
                         request["estado"] = "Notificada"
-                    missing = request.get("datos_faltantes", [])
-                    print(
-                        "[NOTIFICACIÓN SIMULADA] "
-                        f"Para: {recipient} | Cliente: {request['cliente'] or 'No identificado'} | "
-                        f"Rol: {request['rol'] or 'No identificado'} | "
-                        f"Cantidad: {request['cantidad_posiciones'] or 'No identificada'} | "
-                        f"{request['asunto']} | correo {identifier}"
-                    )
-                    if missing:
+                        decision = "notificacion_simulada"
+                        reason = (
+                            f"Notificación simulada al PM {recipient}; no se "
+                            "envió ningún correo real."
+                        )
                         print(
-                            "  Información por completar: "
-                            + ", ".join(missing)
+                            "[NOTIFICACIÓN SIMULADA] "
+                            f"Para: {recipient} | {request['asunto']} | "
+                            f"correo {identifier}"
                         )
-                        for question in questions:
-                            print(f"  El PM puede responder: {question}")
-                        print(
-                            "  Escribe `pm "
-                            f"{next(index for index, item in enumerate(state['solicitudes'], 1) if item['id'] == identifier)}"
-                            "` para aportar la respuesta del PM."
+                    else:
+                        profile = profiles_by_pm.get(
+                            normalize_text(str(recipient)),
+                            {},
                         )
-                    decision = "notificacion_simulada"
-                    reason = (
-                        f"Notificación simulada al PM {recipient} en la hora "
-                        f"{state['hora_actual']}; no se envió ningún correo real."
-                        + (
-                            " Quedan datos pendientes: " + ", ".join(missing) + "."
-                            if missing
-                            else ""
+                        profile_emails = profile.get("emails") or []
+                        if isinstance(profile_emails, str):
+                            profile_emails = [profile_emails]
+                        recipient_email = next(
+                            (
+                                str(address).strip().casefold()
+                                for address in profile_emails
+                                if isinstance(address, str)
+                                and re.fullmatch(
+                                    r"[^@\s]+@[^@\s]+\.[^@\s]+",
+                                    address.strip(),
+                                )
+                            ),
+                            None,
                         )
-                    )
+                        if recipient_email is None:
+                            decision = "notificacion_pendiente"
+                            reason = (
+                                f"No hay correo válido configurado para el PM "
+                                f"{recipient}; la solicitud requiere notificación."
+                            )
+                            error_event = audit_error(
+                                audit,
+                                reason,
+                                node="notificar_pm_por_correo",
+                                hora_simulada=state["hora_actual"],
+                                solicitud=identifier,
+                                details={"pm_responsable": recipient},
+                            )
+                            events.append(error_event)
+                        else:
+                            email_details = send_lifecycle_notification(
+                                client,
+                                recipient_email,
+                                "solicitud_asignada",
+                                request,
+                                context={
+                                    "saludo": f"Hola {recipient},",
+                                    "razon": (
+                                        "Confirma si puedes atender esta solicitud."
+                                    ),
+                                },
+                                state=state,
+                                audit=audit,
+                                config=agent_config,
+                                llm=llm,
+                            )
+                            llm_calls = state["llamadas_llm"]
+                            request["notificacion_pm_message_id"] = (
+                                email_details.get("message_id")
+                            )
+                            request.setdefault(
+                                "notificaciones_email", []
+                            ).append(
+                                {
+                                    "tipo": "solicitud_asignada",
+                                    **email_details,
+                                }
+                            )
+                            request["estado"] = "Notificada"
+                            decision = "notificacion_por_correo"
+                            reason = (
+                                f"Se notificó por correo al PM {recipient}."
+                            )
+                            print(
+                                f"[CORREO ENVIADO] Nueva solicitud para "
+                                f"{recipient} ({recipient_email}): "
+                                f"{request['asunto']}."
+                            )
                 else:
                     decision = "notificacion_pendiente"
                     reason = (

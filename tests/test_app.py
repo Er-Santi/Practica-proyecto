@@ -148,8 +148,8 @@ def test_rules_detect_natural_language_staffing_requests(
 def test_rules_distinguish_pm_acceptance_from_completed_work() -> None:
     assert infer_request_status("Me hago cargo de esta solicitud.") == "confirmada"
     assert infer_request_status("I will take ownership of this.") == "confirmada"
-    assert infer_request_status("The positions are filled.") == "cerrada"
-    assert infer_request_status("Solicitud completada.") == "cerrada"
+    assert infer_request_status("The positions are filled.") == "completada"
+    assert infer_request_status("Solicitud completada.") == "completada"
 
 
 def test_positive_staffing_rules_override_llm_unrelated_result(
@@ -859,6 +859,7 @@ def test_pm_natural_language_update_completes_missing_request_fields(
         FakeAgentMailClient([[message]]),
         audit_path=audit_path,
         assignments={"Acme": "PM Ana"},
+        pm_profiles={"PM Ana": {"perfil": "normal"}},
     )
 
     class FakeOpenRouter:
@@ -1016,7 +1017,7 @@ def test_graph_uses_openrouter_for_natural_language_and_assignment(
     result = run_phase_one(
         FakeAgentMailClient([[message]]),
         audit_path=audit_path,
-        assignments={"Acme": "PM Ana"},
+        assignments={"Acme": "PM Santiago"},
         llm=FakeOpenRouter(),
     )
 
@@ -1025,7 +1026,7 @@ def test_graph_uses_openrouter_for_natural_language_and_assignment(
     assert request["cliente"] == "Acme"
     assert request["rol"] == "Analista de datos"
     assert request["cantidad_posiciones"] == 2
-    assert request["pm_responsable"] == "PM Ana"
+    assert request["pm_responsable"] == "PM Allisson"
     assert "dos analistas" in request["pregunta_confirmacion"]
     assert request["preguntas_aclaracion"] == []
     assert request["estado"] == "Notificada"
@@ -1040,7 +1041,7 @@ def test_graph_uses_openrouter_for_natural_language_and_assignment(
         and event["datos"]["metodo_clasificacion"] == "openrouter"
         for event in events
     )
-    assert "Para: PM Ana" in capsys.readouterr().out
+    assert "Para: PM Allisson" in capsys.readouterr().out
 
 
 def test_openrouter_classifies_duplicate_against_existing_requests(
@@ -1407,6 +1408,7 @@ def test_rf03_rf04_rf10_extract_assign_notify_and_audit(tmp_path: Path) -> None:
         FakeAgentMailClient([[message]]),
         audit_path=audit_path,
         assignments=assignments,
+        pm_profiles={"PM Ana": {"perfil": "normal"}},
     )
 
     request = result["solicitudes"][0]
@@ -1713,6 +1715,7 @@ def test_pm_can_be_assigned_to_one_request_and_notified_from_terminal(
             "simular_confirmacion_automatica": False,
         },
         assignments={},
+        pm_profiles={},
     )
 
     same_state = assign_pm_to_request(
@@ -1978,7 +1981,9 @@ def test_pm_email_autoreply_disables_pm_and_reassigns_open_requests(
     )
 
     assert result["correos_procesados"] == ["pm-away-1"]
-    assert result["solicitudes"][0]["pm_responsable"] == "PM Luis"
+    assert result["solicitudes"][0]["pm_responsable"] == "pm.ana@empresa.com"
+    assert result["solicitudes"][0]["responsable_actual"] == "Erick"
+    assert result["solicitudes"][0]["estado"] == "Escalada"
     assert profiles["pm ana"]["elegible"] is False
     persisted_profiles = load_pm_profiles(
         profiles_path,
@@ -2000,7 +2005,14 @@ def test_pm_email_autoreply_disables_pm_and_reassigns_open_requests(
         event["decision"] == "pm_marcado_no_elegible_por_ausencia"
         for event in events
     )
-    assert any(event["decision"] == "solicitud_reasignada" for event in events)
+    absence_event = next(
+        event
+        for event in events
+        if event["decision"] == "pm_marcado_no_elegible_por_ausencia"
+    )
+    assert absence_event["datos"]["solicitudes_escaladas"] == [
+        "request-active"
+    ]
 
     next_request = run_phase_one(
         FakeAgentMailClient(
@@ -2248,7 +2260,7 @@ def test_user_can_confirm_or_reject_without_a_new_email(tmp_path: Path) -> None:
     state = run_phase_one(
         FakeAgentMailClient([[message]]),
         audit_path=audit_path,
-        assignments={"Acme": "PM Ana"},
+        assignments={"Acme": "PM Allisson"},
     )
 
     apply_human_confirmation(
@@ -2271,7 +2283,7 @@ def test_user_can_confirm_or_reject_without_a_new_email(tmp_path: Path) -> None:
     assert request["hora_confirmacion"] == state["hora_actual"]
     assert request["confirmacion_usuario"] is True
     assert completed_requests(state) == []
-    assert count_open_projects(state["solicitudes"], "PM Ana") == 1
+    assert count_open_projects(state["solicitudes"], "PM Allisson") == 1
 
     complete_request(
         state,
@@ -2355,6 +2367,7 @@ def test_service_repeats_graph_until_stopped_and_emits_heartbeat(
         on_state=publish,
         reconnect_interval=0.001,
         heartbeat_interval=1e-9,
+        pm_profiles={},
     )
 
     assert client.list_calls == 1
@@ -2447,6 +2460,7 @@ def test_service_backfills_old_messages_and_restores_active_state(
         stop_event=stop_event,
         on_state=stop_after_backfill,
         assignments={},
+        pm_profiles={},
         state_path=state_path,
     )
 
@@ -2487,6 +2501,7 @@ def test_service_reclassifies_saved_staffing_emails_previously_marked_unrelated(
         on_state=stop_after_reclassification,
         reconnect_interval=0.01,
         assignments={"Acme": "PM Ana"},
+        pm_profiles={},
         initial_state=initial_state,
         state_path=tmp_path / "state.json",
     )
@@ -2507,6 +2522,376 @@ def test_service_reclassifies_saved_staffing_emails_previously_marked_unrelated(
     )
 
 
+def test_service_answers_natural_language_case_query_from_shared_mailbox(
+    tmp_path: Path,
+) -> None:
+    shared_email = "team@example.test"
+    profiles = {
+        "PM Santiago": {
+            "nombre": "PM Santiago",
+            "perfil": "normal",
+            "elegible": True,
+            "emails": [shared_email],
+        },
+        "PM Allisson": {
+            "nombre": "PM Allisson",
+            "perfil": "normal",
+            "elegible": True,
+            "emails": [shared_email],
+        },
+    }
+    state = initial_agent_state()
+    state["solicitudes"] = [
+        {
+            "id": "case-santiago",
+            "asunto": "Solicitud de analistas",
+            "pm_responsable": "PM Santiago",
+            "responsable_actual": "PM Santiago",
+            "estado": "Notificada",
+            "fecha_notificacion": datetime.now(timezone.utc).isoformat(),
+        },
+        {
+            "id": "case-allisson",
+            "asunto": "Solicitud de ingenieros",
+            "pm_responsable": "PM Allisson",
+            "responsable_actual": "PM Allisson",
+            "estado": "Notificada",
+            "fecha_notificacion": datetime.now(timezone.utc).isoformat(),
+        },
+    ]
+    query = make_message(
+        "query-cases",
+        "Consulta",
+        "¿Me puedes decir qué casos tengo pendientes?",
+        sender=f"Erick <{shared_email}>",
+    )
+    stop_event = threading.Event()
+    client = RecordingAgentMailClient(
+        events=[query],
+        stop_event=stop_event,
+    )
+
+    def stop_after_reply(updated_state) -> None:
+        if "query-cases" in updated_state["correos_procesados"]:
+            stop_event.set()
+
+    result = run_agent_forever(
+        client,
+        audit_path=tmp_path / "audit.jsonl",
+        stop_event=stop_event,
+        on_state=stop_after_reply,
+        assignments={
+            "Acme": "PM Santiago",
+            "Globex": "PM Allisson",
+        },
+        pm_profiles=profiles,
+        initial_state=state,
+        state_path=tmp_path / "state.json",
+        config=AgentConfig(
+            llm_enabled=False,
+            manager_name="Erick",
+            manager_email=shared_email,
+        ),
+    )
+
+    assert result["correos_clasificados"][-1]["categoria"] == "consulta_casos"
+    assert len(client.sent_messages) == 1
+    recipient, subject, body = client.sent_messages[0]
+    assert recipient == shared_email
+    assert subject == "Solicitudes pendientes asignadas"
+    assert "case-santiago" in body
+    assert "case-allisson" in body
+
+
+def test_manager_email_reply_accepts_absent_pm_escalation(
+    tmp_path: Path,
+) -> None:
+    shared_email = "team@example.test"
+    profiles = {
+        "PM Santiago": {
+            "nombre": "PM Santiago",
+            "perfil": "normal",
+            "elegible": True,
+            "emails": [shared_email],
+        }
+    }
+    state = initial_agent_state()
+    state["solicitudes"] = [
+        {
+            "id": "case-approval",
+            "asunto": "Solicitud urgente",
+            "correo_solicitante": "requester@example.test",
+            "pm_responsable": "PM Santiago",
+            "jefe_responsable": "Erick",
+            "responsable_actual": "Erick",
+            "escalada_a_jefe": True,
+            "escalamiento_ausencia_pendiente": True,
+            "aprobacion_director_message_id": "approval-email-1",
+            "estado": "Escalada",
+            "fecha_notificacion": datetime.now(timezone.utc).isoformat(),
+        }
+    ]
+    approval = make_message(
+        "approval-reply-1",
+        "Re: [Aprobación de escalamiento solicitada] case-approval",
+        "Sí, acepto hacerme cargo.",
+        sender=f"Erick <{shared_email}>",
+        in_reply_to="approval-email-1",
+    )
+    stop_event = threading.Event()
+    client = RecordingAgentMailClient(
+        events=[approval],
+        stop_event=stop_event,
+    )
+
+    def stop_after_approval(updated_state) -> None:
+        if "approval-reply-1" in updated_state["correos_procesados"]:
+            stop_event.set()
+
+    result = run_agent_forever(
+        client,
+        audit_path=tmp_path / "audit.jsonl",
+        stop_event=stop_event,
+        on_state=stop_after_approval,
+        assignments={"Acme": "PM Santiago"},
+        pm_profiles=profiles,
+        initial_state=state,
+        state_path=tmp_path / "state.json",
+        config=AgentConfig(
+            llm_enabled=False,
+            manager_name="Erick",
+            manager_email=shared_email,
+        ),
+    )
+
+    request = result["solicitudes"][0]
+    assert request["responsable_actual"] == "Erick"
+    assert request["jefe_responsable"] == "Erick"
+    assert request["estado"] == "Confirmada"
+    assert request["escalamiento_ausencia_pendiente"] is False
+    assert len(client.sent_messages) == 1
+    assert client.sent_messages[0][0] == "requester@example.test"
+    assert "[Solicitud aceptada por el jefe]" in client.sent_messages[0][1]
+
+
+def test_shared_mailbox_pm_reply_is_not_mistaken_for_manager_approval(
+    tmp_path: Path,
+) -> None:
+    shared_email = "team@example.test"
+    profiles = {
+        "PM Santiago": {
+            "nombre": "PM Santiago",
+            "perfil": "normal",
+            "elegible": True,
+            "emails": [shared_email],
+        },
+        "PM Allisson": {
+            "nombre": "PM Allisson",
+            "perfil": "normal",
+            "elegible": True,
+            "emails": [shared_email],
+        },
+    }
+    state = initial_agent_state()
+    state["solicitudes"] = [
+        {
+            "id": "case-shared-thread",
+            "asunto": "Solicitud de analistas",
+            "correo_solicitante": "requester@example.test",
+            "pm_responsable": "PM Santiago",
+            "jefe_responsable": "Erick",
+            "responsable_actual": "Erick",
+            "escalada_a_jefe": True,
+            "escalamiento_ausencia_pendiente": True,
+            "aprobacion_director_pendiente": True,
+            "aprobacion_director_message_id": "approval-email-2",
+            "notificacion_pm_message_id": "pm-email-2",
+            "estado": "Escalada",
+            "fecha_notificacion": datetime.now(timezone.utc).isoformat(),
+        }
+    ]
+    pm_reply = make_message(
+        "pm-reply-shared-thread",
+        "Re: [Nueva solicitud asignada] case-shared-thread",
+        "Me hago cargo de esta solicitud.",
+        sender=f"PM Santiago <{shared_email}>",
+        in_reply_to="pm-email-2",
+    )
+    stop_event = threading.Event()
+    client = RecordingAgentMailClient(
+        events=[pm_reply],
+        stop_event=stop_event,
+    )
+
+    def stop_after_pm_reply(updated_state) -> None:
+        if "pm-reply-shared-thread" in updated_state["correos_procesados"]:
+            stop_event.set()
+
+    result = run_agent_forever(
+        client,
+        audit_path=tmp_path / "audit.jsonl",
+        stop_event=stop_event,
+        on_state=stop_after_pm_reply,
+        assignments={"Acme": "PM Santiago"},
+        pm_profiles=profiles,
+        initial_state=state,
+        state_path=tmp_path / "state.json",
+        config=AgentConfig(
+            llm_enabled=False,
+            manager_name="Erick",
+            manager_email=shared_email,
+        ),
+    )
+
+    request = result["solicitudes"][0]
+    assert request["estado"] == "Confirmada"
+    assert request["responsable_actual"] == "Erick"
+    assert request["escalamiento_ausencia_pendiente"] is False
+    assert request.get("respuesta_aprobacion_director") is None
+    assert not any(
+        event["decision"] == "jefe_acepto_escalamiento"
+        for event in result["eventos"]
+    )
+
+
+def test_ambiguous_absence_from_shared_mailbox_does_not_disable_every_pm(
+    tmp_path: Path,
+) -> None:
+    shared_email = "team@example.test"
+    profiles = {
+        name: {
+            "nombre": name,
+            "perfil": "normal",
+            "elegible": True,
+            "emails": [shared_email],
+        }
+        for name in ("PM Santiago", "PM Allisson")
+    }
+    state = initial_agent_state()
+    state["solicitudes"] = [
+        {
+            "id": "case-santiago",
+            "asunto": "Caso Santiago",
+            "pm_responsable": "PM Santiago",
+            "responsable_actual": "PM Santiago",
+            "estado": "Notificada",
+            "fecha_notificacion": datetime.now(timezone.utc).isoformat(),
+        },
+        {
+            "id": "case-allisson",
+            "asunto": "Caso Allisson",
+            "pm_responsable": "PM Allisson",
+            "responsable_actual": "PM Allisson",
+            "estado": "Notificada",
+            "fecha_notificacion": datetime.now(timezone.utc).isoformat(),
+        },
+    ]
+    absence = make_message(
+        "ambiguous-away",
+        "Automatic reply: Vacation",
+        "I am out of office on vacation.",
+        sender=f"Shared inbox <{shared_email}>",
+    )
+    stop_event = threading.Event()
+    client = FakeAgentMailClient(
+        [],
+        events=[absence],
+        stop_event=stop_event,
+    )
+
+    def stop_after_review(updated_state) -> None:
+        if "ambiguous-away" in updated_state["correos_procesados"]:
+            stop_event.set()
+
+    result = run_agent_forever(
+        client,
+        audit_path=tmp_path / "audit.jsonl",
+        stop_event=stop_event,
+        on_state=stop_after_review,
+        assignments={
+            "Acme": "PM Santiago",
+            "Globex": "PM Allisson",
+        },
+        pm_profiles=profiles,
+        initial_state=state,
+        state_path=tmp_path / "state.json",
+        profiles_path=tmp_path / "pms.csv",
+        config=AgentConfig(
+            llm_enabled=False,
+            manager_name="Erick",
+            manager_email=shared_email,
+        ),
+    )
+
+    assert all(profile["elegible"] for profile in profiles.values())
+    assert all(
+        request["estado"] == "Notificada"
+        for request in result["solicitudes"]
+    )
+    assert result["correos_clasificados"][-1]["categoria"] == (
+        "respuesta_ausencia_pm_ambigua"
+    )
+
+
+def test_service_migrates_active_requests_to_current_pm_roster(
+    tmp_path: Path,
+) -> None:
+    profiles = {
+        "PM Santiago": {
+            "nombre": "PM Santiago",
+            "perfil": "normal",
+            "elegible": True,
+            "emails": ["santiago@example.test"],
+        },
+        "PM Allisson": {
+            "nombre": "PM Allisson",
+            "perfil": "normal",
+            "elegible": True,
+            "emails": ["allisson@example.test"],
+        },
+    }
+    state = initial_agent_state()
+    state["solicitudes"] = [
+        {
+            "id": "legacy-case",
+            "asunto": "Solicitud heredada",
+            "pm_responsable": "PM Ana",
+            "responsable_actual": "PM Ana",
+            "estado": "Notificada",
+            "fecha_notificacion": datetime.now(timezone.utc).isoformat(),
+        }
+    ]
+    stop_event = threading.Event()
+    client = RecordingAgentMailClient(stop_event=stop_event)
+
+    def stop_after_migration(updated_state) -> None:
+        if updated_state["solicitudes"][0]["pm_responsable"] != "PM Ana":
+            stop_event.set()
+
+    result = run_agent_forever(
+        client,
+        audit_path=tmp_path / "audit.jsonl",
+        stop_event=stop_event,
+        on_state=stop_after_migration,
+        assignments={
+            "Acme": "PM Santiago",
+            "Globex": "PM Allisson",
+        },
+        pm_profiles=profiles,
+        initial_state=state,
+        state_path=tmp_path / "state.json",
+        config=AgentConfig(llm_enabled=False),
+    )
+
+    request = result["solicitudes"][0]
+    assert request["pm_anterior"] == "PM Ana"
+    assert request["pm_responsable"] == "PM Allisson"
+    assert request["estado"] == "Notificada"
+    assert len(client.sent_messages) == 1
+    assert client.sent_messages[0][0] == "allisson@example.test"
+    assert "[Solicitud reasignada]" in client.sent_messages[0][1]
+
+
 def test_due_reminder_is_sent_once_after_configured_four_hours(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -2521,6 +2906,7 @@ def test_due_reminder_is_sent_once_after_configured_four_hours(
         FakeAgentMailClient([[message]]),
         audit_path=audit_path,
         assignments={"Acme": "PM Ana"},
+        pm_profiles={"PM Ana": {"perfil": "normal"}},
     )
     request = state["solicitudes"][0]
     notified_at = datetime.fromisoformat(
@@ -2589,6 +2975,12 @@ def test_first_due_reminder_sends_one_real_email_with_generic_template(
         state,
         audit=JsonlAuditLog(audit_path),
         config=config,
+        pm_profiles={
+            "PM Ana": {
+                "nombre": "PM Ana",
+                "emails": ["santiagovargasquesada17@gmail.com"],
+            }
+        },
         mail_client=client,
         now=notified_at + timedelta(hours=4),
     )
@@ -2596,15 +2988,23 @@ def test_first_due_reminder_sends_one_real_email_with_generic_template(
     assert len(client.sent_messages) == 1
     recipient, subject, body = client.sent_messages[0]
     assert recipient == "santiagovargasquesada17@gmail.com"
-    assert subject == "Recordatorio de seguimiento: Solicitud de Analista"
+    assert subject == (
+        "[Recordatorio de solicitud] request-1: Solicitud de Analista"
+    )
     assert "Cliente: Acme" in body
-    assert "PM asignado: PM Ana" in body
+    assert "PM responsable: PM Ana" in body
     assert request["correo_recordatorio_real_enviado"] is True
 
     process_due_reminders(
         state,
         audit=JsonlAuditLog(audit_path),
         config=config,
+        pm_profiles={
+            "PM Ana": {
+                "nombre": "PM Ana",
+                "emails": ["santiagovargasquesada17@gmail.com"],
+            }
+        },
         mail_client=client,
         now=notified_at + timedelta(hours=5),
     )
@@ -2649,7 +3049,13 @@ def test_first_due_reminder_uses_llm_written_body_when_available(
     tmp_path: Path,
 ) -> None:
     class ReminderWriter(OpenRouterClient):
-        def write_reminder_email(self, request: dict[str, Any]) -> str:
+        def write_lifecycle_email(
+            self,
+            event_type: str,
+            request: dict[str, Any],
+            context: dict[str, Any],
+        ) -> str:
+            assert event_type == "recordatorio"
             return f"Seguimiento personalizado para {request['asunto']}."
 
     llm = ReminderWriter("test-key", "provider/test-model")
@@ -2673,6 +3079,12 @@ def test_first_due_reminder_uses_llm_written_body_when_available(
             reminder_email_enabled=True,
             reminder_email_recipient="santiagovargasquesada17@gmail.com",
         ),
+        pm_profiles={
+            "PM Ana": {
+                "nombre": "PM Ana",
+                "emails": ["santiagovargasquesada17@gmail.com"],
+            }
+        },
         mail_client=client,
         llm=llm,
         now=notified_at + timedelta(hours=4),
@@ -2693,7 +3105,13 @@ def test_first_due_reminder_retries_llm_and_uses_template_on_failure(
             super().__init__("test-key", "provider/test-model")
             self.calls = 0
 
-        def write_reminder_email(self, request: dict[str, Any]) -> str:
+        def write_lifecycle_email(
+            self,
+            event_type: str,
+            request: dict[str, Any],
+            context: dict[str, Any],
+        ) -> str:
+            assert event_type == "recordatorio"
             self.calls += 1
             raise OpenRouterError("salida inválida")
 
@@ -2722,6 +3140,12 @@ def test_first_due_reminder_retries_llm_and_uses_template_on_failure(
             reminder_email_enabled=True,
             reminder_email_recipient="santiagovargasquesada17@gmail.com",
         ),
+        pm_profiles={
+            "PM Luis": {
+                "nombre": "PM Luis",
+                "emails": ["santiagovargasquesada17@gmail.com"],
+            }
+        },
         mail_client=client,
         llm=llm,
         now=notified_at + timedelta(hours=4),
@@ -2730,8 +3154,8 @@ def test_first_due_reminder_retries_llm_and_uses_template_on_failure(
     assert llm.calls == 2
     assert state["llamadas_llm"] == 2
     assert len(client.sent_messages) == 1
-    assert "ID: request-2" in client.sent_messages[0][2]
-    assert "PM asignado: PM Luis" in client.sent_messages[0][2]
+    assert "Solicitud: request-2" in client.sent_messages[0][2]
+    assert "PM responsable: PM Luis" in client.sent_messages[0][2]
     events = [
         json.loads(line)
         for line in audit_path.read_text(encoding="utf-8").splitlines()
@@ -2739,12 +3163,12 @@ def test_first_due_reminder_retries_llm_and_uses_template_on_failure(
     llm_errors = [
         event
         for event in events
-        if event["nodo"] == "redactar_recordatorio_llm"
+        if event["nodo"] == "redactar_correo_ciclo_vida_llm"
     ]
     assert len(llm_errors) == 2
     sent_event = next(
         event for event in events
-        if event["decision"] == "recordatorio_real_enviado"
+        if event["decision"] == "correo_ciclo_vida_enviado"
     )
     assert sent_event["datos"]["metodo_redaccion"] == "plantilla"
 
@@ -3447,6 +3871,7 @@ def test_opened_request_and_terminal_close_transition_are_audited(
             "simular_confirmacion_automatica": False,
         },
         assignments={},
+        pm_profiles={},
     )
     request = state["solicitudes"][0]
     assert request["estado"] == "Nueva"
@@ -3648,6 +4073,99 @@ def test_terminal_close_and_complete_save_reasons_and_show_them_in_history(
     )
 
 
+def test_terminal_close_and_complete_send_lifecycle_emails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    state = initial_agent_state()
+    state["solicitudes"] = [
+        {
+            "id": "request-close",
+            "asunto": "Solicitud cancelada",
+            "cliente": "Acme",
+            "pm_responsable": "PM Santiago",
+            "estado": "Notificada",
+            "correo_solicitante": "requester1@example.test",
+        },
+        {
+            "id": "request-complete",
+            "asunto": "Solicitud completada",
+            "cliente": "Globex",
+            "pm_responsable": "PM Santiago",
+            "estado": "Notificada",
+            "correo_solicitante": "requester2@example.test",
+        },
+    ]
+    state_path = tmp_path / "state.json"
+    save_agent_state(state_path, state)
+    shared_pm_address = "pm@example.test"
+
+    class IdleRecordingAgentMailClient(RecordingAgentMailClient):
+        async def message_events(self):
+            self.stream_calls += 1
+            yield {"type": "subscribed"}
+            await asyncio.Event().wait()
+
+    class FakePromptSession:
+        def __init__(self) -> None:
+            self.commands = iter(
+                [
+                    "close 1 Cliente canceló por presupuesto.",
+                    "complete 2 Se cubrieron las posiciones.",
+                    "stop",
+                ]
+            )
+
+        def prompt(self, prompt_text: str) -> str:
+            assert prompt_text == "agentmail> "
+            return next(self.commands)
+
+    import terminal as terminal_module
+
+    monkeypatch.setattr(terminal_module, "PromptSession", FakePromptSession)
+    monkeypatch.setattr(terminal_module, "patch_stdout", lambda: nullcontext())
+    client = IdleRecordingAgentMailClient()
+
+    run_terminal_agent(
+        client,
+        audit_path=tmp_path / "audit.jsonl",
+        reconnect_interval=0.01,
+        assignments={
+            "Acme": "PM Santiago",
+            "Globex": "PM Santiago",
+        },
+        pm_profiles={
+            "PM Santiago": {
+                "nombre": "PM Santiago",
+                "perfil": "normal",
+                "elegible": True,
+                "emails": [shared_pm_address],
+            }
+        },
+        state_path=state_path,
+        config=AgentConfig(llm_enabled=False),
+    )
+
+    assert len(client.sent_messages) == 4
+    recipients = {
+        message[0]
+        for message in client.sent_messages
+    }
+    assert recipients == {
+        "requester1@example.test",
+        "requester2@example.test",
+        shared_pm_address,
+    }
+    assert any(
+        "Cliente canceló por presupuesto." in message[2]
+        for message in client.sent_messages
+    )
+    assert any(
+        "Se cubrieron las posiciones." in message[2]
+        for message in client.sent_messages
+    )
+
+
 def test_pm_acceptance_and_completion_have_distinct_statuses(
     tmp_path: Path,
 ) -> None:
@@ -3661,6 +4179,7 @@ def test_pm_acceptance_and_completion_have_distinct_statuses(
         FakeAgentMailClient([[message]]),
         audit_path=audit_path,
         assignments={"Acme": "PM Ana"},
+        pm_profiles={"PM Ana": {"perfil": "normal"}},
     )
 
     apply_pm_update(
@@ -3801,8 +4320,18 @@ class FakeAgentMailClient(AgentMailClient):
 
 
 class RecordingAgentMailClient(FakeAgentMailClient):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        inbox_responses: list[list[dict[str, Any]]] | None = None,
+        *,
+        events: list[dict[str, Any]] | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        super().__init__(
+            inbox_responses,
+            events=events,
+            stop_event=stop_event,
+        )
         self.sent_messages: list[tuple[str, str, str]] = []
 
     def send(self, recipient: str, subject: str, text: str) -> None:

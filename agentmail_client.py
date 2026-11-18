@@ -100,12 +100,18 @@ class AgentMailClient:
             payload={"text": text},
         )
 
-    def send(self, recipient: str, subject: str, text: str) -> None:
-        self._request(
+    def send(self, recipient: str, subject: str, text: str) -> str | None:
+        data = self._request(
             "POST",
             f"/inboxes/{self._inbox_path}/messages/send",
             payload={"to": recipient, "subject": subject, "text": text},
         )
+        message = data.get("message")
+        message_data = message if isinstance(message, dict) else data
+        identifier = message_data.get("message_id") or message_data.get(
+            "messageId"
+        )
+        return identifier.strip() if isinstance(identifier, str) else None
 
     async def message_events(self) -> AsyncIterator[dict[str, Any]]:
         """Yield new inbox messages through AgentMail's WebSocket event stream."""

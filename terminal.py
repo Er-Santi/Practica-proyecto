@@ -17,6 +17,7 @@ from email_utils import (
     load_pm_profiles,
     normalize_text,
 )
+from email_notifications import send_lifecycle_notification
 from exceptions import AgentMailError, OpenRouterError
 from openrouter_client import OpenRouterClient
 from pm_assignment import count_open_projects
@@ -262,6 +263,130 @@ def run_terminal_agent(
                 node="persistir_estado_agente",
             )
             print(f"\n[ERROR Estado] {exc}")
+
+    def profile_email_for_pm(pm_name: str | None) -> str | None:
+        if not pm_name:
+            return None
+        for key, profile in (pm_profiles or {}).items():
+            if normalize_text(pm_name) not in {
+                normalize_text(str(key)),
+                normalize_text(str(profile.get("nombre") or "")),
+            }:
+                continue
+            addresses = profile.get("emails") or []
+            if isinstance(addresses, str):
+                addresses = [addresses]
+            return next(
+                (
+                    address.strip().casefold()
+                    for address in addresses
+                    if isinstance(address, str) and "@" in address
+                ),
+                None,
+            )
+        return None
+
+    def notify_lifecycle(
+        request: dict[str, Any],
+        event_type: str,
+        *,
+        reason: str,
+    ) -> None:
+        recipients: list[str] = []
+        if event_type in {"solicitud_asignada", "solicitud_reasignada"}:
+            pm_email = profile_email_for_pm(
+                str(request.get("pm_responsable") or "")
+            )
+            if pm_email:
+                recipients.append(pm_email)
+        else:
+            requester_email = str(
+                request.get("correo_solicitante") or ""
+            ).strip()
+            if requester_email:
+                recipients.append(requester_email)
+            pm_email = profile_email_for_pm(
+                str(request.get("pm_responsable") or "")
+            )
+            if pm_email:
+                recipients.append(pm_email)
+            if (
+                request.get("escalada_a_jefe")
+                or request.get("jefe_responsable")
+            ) and agent_config.manager_email:
+                recipients.append(agent_config.manager_email)
+            if event_type == "escalamiento_jefe":
+                recipients = (
+                    [agent_config.manager_email]
+                    if agent_config.manager_email
+                    else []
+                )
+        recipients = list(
+            dict.fromkeys(
+                address.strip().casefold()
+                for address in recipients
+                if address and "@" in address
+            )
+        )
+        if not recipients:
+            error = audit_error(
+                JsonlAuditLog(audit_path),
+                "No hay destinatarios configurados para la notificación.",
+                node="notificar_cambio_terminal",
+                hora_simulada=state_snapshot["hora_actual"],
+                solicitud=str(request.get("id") or "") or None,
+                details={"tipo_evento": event_type},
+            )
+            state_snapshot["eventos"].append(error)
+            print(
+                f"\n[ERROR CORREO] No hay destinatario configurado para "
+                f"{event_type}."
+            )
+            return
+        for recipient in recipients:
+            try:
+                details = send_lifecycle_notification(
+                    client,
+                    recipient,
+                    event_type,
+                    request,
+                    context={"razon": reason},
+                    state=state_snapshot,
+                    audit=JsonlAuditLog(audit_path),
+                    config=agent_config,
+                    llm=llm,
+                )
+            except (AgentMailError, ValueError) as exc:
+                if isinstance(exc, ValueError):
+                    error = audit_error(
+                        JsonlAuditLog(audit_path),
+                        exc,
+                        node="notificar_cambio_terminal",
+                        hora_simulada=state_snapshot["hora_actual"],
+                        solicitud=str(request.get("id") or "") or None,
+                        details={
+                            "tipo_evento": event_type,
+                            "destinatario": recipient,
+                        },
+                    )
+                    state_snapshot["eventos"].append(error)
+                print(
+                    f"\n[ERROR CORREO] No se pudo enviar "
+                    f"{event_type} a {recipient}: {exc}"
+                )
+            else:
+                request.setdefault("notificaciones_email", []).append(
+                    {"tipo": event_type, **details}
+                )
+                if event_type in {
+                    "solicitud_asignada",
+                    "solicitud_reasignada",
+                }:
+                    request["notificacion_pm_message_id"] = (
+                        details.get("message_id")
+                    )
+                    if request.get("estado") == "Nueva":
+                        request["estado"] = "Notificada"
 
     def store_state(new_state: AgentState) -> None:
         nonlocal state_snapshot
@@ -557,6 +682,10 @@ def run_terminal_agent(
                                     current_profile = pm_profiles[matching_key]
                                     current_profile.clear()
                                     current_profile.update(latest_profile)
+                            previous_assignments = {
+                                request["id"]: request.get("pm_responsable")
+                                for request in state_snapshot["solicitudes"]
+                            }
                             set_pm_eligibility(
                                 state_snapshot,
                                 pm_name=pm_name,
@@ -568,6 +697,22 @@ def run_terminal_agent(
                                 simulation_seed=simulation_seed,
                                 config=agent_config,
                             )
+                            reassigned_requests = [
+                                request
+                                for request in state_snapshot["solicitudes"]
+                                if request.get("pm_responsable")
+                                and request.get("pm_responsable")
+                                != previous_assignments.get(request["id"])
+                            ]
+                            for request in reassigned_requests:
+                                notify_lifecycle(
+                                    request,
+                                    "solicitud_reasignada",
+                                    reason=str(
+                                        request.get("motivo_reasignacion")
+                                        or f"{pm_name} dejó de ser elegible."
+                                    ),
+                                )
                         persist_state()
                     except (OSError, ValueError) as exc:
                         print(f"No se pudo cambiar la elegibilidad del PM: {exc}")
@@ -604,6 +749,13 @@ def run_terminal_agent(
                                 confirmed=answer in {"si", "yes", "y"},
                                 audit=JsonlAuditLog(audit_path),
                             )
+                            if answer in {"si", "yes", "y"}:
+                                request = requests[request_index]
+                                notify_lifecycle(
+                                    request,
+                                    "confirmacion_pm",
+                                    reason="Se confirmó que la solicitud será atendida.",
+                                )
                         persist_state()
                     except (KeyError, ValueError) as exc:
                         print(f"No se pudo registrar la confirmación: {exc}")
@@ -670,6 +822,14 @@ def run_terminal_agent(
                                 simulation_seed=simulation_seed,
                                 config=agent_config,
                             )
+                            request = state_snapshot["solicitudes"][
+                                request_index - 1
+                            ]
+                            notify_lifecycle(
+                                request,
+                                "solicitud_asignada",
+                                reason="Asignación realizada desde la terminal.",
+                            )
                         persist_state()
                     except (IndexError, ValueError) as exc:
                         print(f"No se pudo asignar el PM: {exc}")
@@ -699,6 +859,14 @@ def run_terminal_agent(
                         continue
                     try:
                         with state_lock:
+                            request = state_snapshot["solicitudes"][
+                                request_index - 1
+                            ]
+                            previous_status = request.get("estado")
+                            previous_pm = request.get("pm_responsable")
+                            previous_completion_date = request.get(
+                                "fecha_completada"
+                            )
                             apply_pm_update(
                                 state_snapshot,
                                 request_number=request_index,
@@ -709,6 +877,46 @@ def run_terminal_agent(
                                 pm_profiles=pm_profiles,
                                 config=agent_config,
                             )
+                            if (
+                                request.get("estado") == "Confirmada"
+                                and previous_status != "Confirmada"
+                            ):
+                                notify_lifecycle(
+                                    request,
+                                    "confirmacion_pm",
+                                    reason="El PM confirmó que atenderá la solicitud.",
+                                )
+                            if (
+                                request.get("estado") == "Cerrada"
+                                and previous_status != "Cerrada"
+                            ):
+                                event_type = (
+                                    "solicitud_completada"
+                                    if request.get("fecha_completada")
+                                    != previous_completion_date
+                                    and request.get("fecha_completada")
+                                    else "solicitud_cerrada"
+                                )
+                                notify_lifecycle(
+                                    request,
+                                    event_type,
+                                    reason=str(
+                                        request.get("razon_finalizacion")
+                                        or response_text
+                                    ),
+                                )
+                            if (
+                                request.get("pm_responsable") != previous_pm
+                                and request.get("pm_responsable")
+                            ):
+                                notify_lifecycle(
+                                    request,
+                                    "solicitud_reasignada",
+                                    reason=str(
+                                        request.get("motivo_reasignacion")
+                                        or "La solicitud se reasignó tras la respuesta del PM."
+                                    ),
+                                )
                         persist_state()
                     except (IndexError, OpenRouterError, ValueError) as exc:
                         print(f"No se pudo aplicar la respuesta del PM: {exc}")
@@ -733,6 +941,14 @@ def run_terminal_agent(
                                 request_number=request_index,
                                 reason=parts[2],
                                 audit=JsonlAuditLog(audit_path),
+                            )
+                            request = state_snapshot["solicitudes"][
+                                request_index - 1
+                            ]
+                            notify_lifecycle(
+                                request,
+                                "solicitud_completada",
+                                reason=parts[2],
                             )
                         persist_state()
                     except (IndexError, ValueError) as exc:
@@ -763,6 +979,14 @@ def run_terminal_agent(
                                 request_number=request_index,
                                 reason=parts[2],
                                 audit=JsonlAuditLog(audit_path),
+                            )
+                            request = state_snapshot["solicitudes"][
+                                request_index - 1
+                            ]
+                            notify_lifecycle(
+                                request,
+                                "solicitud_cerrada",
+                                reason=parts[2],
                             )
                         persist_state()
                         request = state_snapshot["solicitudes"][request_index - 1]

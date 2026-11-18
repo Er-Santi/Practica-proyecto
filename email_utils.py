@@ -859,7 +859,7 @@ def infer_request_status(text: str) -> str | None:
             "ya se cubrió",
         )
     ):
-        return "cerrada"
+        return "completada"
     if any(
         phrase in normalized
         for phrase in (
